@@ -1,0 +1,20 @@
+# Временные файлы сборки ESP-IDF
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+Kconfig.projbuild
+
+# Файлы редакторов и пользовательские
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.bak
+*.~lock*
+GPATH
+GRTAGS
+GTAGS
+cscope*
+*.odt
+pdf/
