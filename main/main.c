@@ -16,6 +16,7 @@
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
 #include "driver/gpio.h"
+#include "ff.h" // Нужен для f_mkfs
 
 // Сетевой стек
 #include "esp_wifi.h"
@@ -69,6 +70,7 @@ RTC_DATA_ATTR static int boot_count = 0;
 static int last_sent_index = 0; 
 static int server_requested_index = -1; 
 static uint64_t global_start_time = 0; // Время старта всей большой сессии
+static bool format_requested = false;
 
 static camera_config_t camera_config = {
     .pin_pwdn = PWDN_GPIO_NUM, .pin_reset = RESET_GPIO_NUM, .pin_xclk = XCLK_GPIO_NUM,
@@ -110,18 +112,25 @@ int read_last_sent_index_from_sd(void) {
     return index;
 }
 
-static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) 
+{
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        esp_wifi_connect(); // Стартуем подключение ОДИН раз при запуске Wi-Fi стека
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < 3) { s_retry_num++; esp_wifi_connect(); } 
-        else { xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT); }
+        if (s_retry_num < 3) {
+            s_retry_num++;
+            esp_wifi_connect();
+            ESP_LOGI(TAG, "Попытка авто-реконнекта %d/3...", s_retry_num);
+        } else {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
-void network_stack_init(void) {
+void network_stack_init(void) 
+{
     s_wifi_event_group = xEventGroupCreate();
     esp_netif_init();
     esp_event_loop_create_default();
@@ -138,10 +147,13 @@ void network_stack_init(void) {
 bool wifi_power_on(void) {
     s_retry_num = 0;
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    
+    // esp_wifi_start() сам сгенерирует событие STA_START, которое пнёт wifi_event_handler
     if (esp_wifi_start() != ESP_OK) return false;
     esp_wifi_set_ps(WIFI_PS_NONE);
-    esp_wifi_connect();
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(6000));
+
+    // Просто ждем флаг от обработчика событий
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(8000));
     return (bits & WIFI_CONNECTED_BIT) ? true : false;
 }
 
@@ -194,6 +206,10 @@ bool send_buffer_to_server(uint8_t *buf, size_t len, int index)
                     esp_restart(); 
                 }
             }
+        } else if (strncmp(rx_buf, "FORMAT_SD", 9) == 0) {
+            // Флаг-команда от смартфона на очистку флешки
+            extern bool format_requested;
+            format_requested = true;			
         } else if (rx_len == 4) {
             // Читаем 4 байта знакового инта напрямую
             int32_t rx_index = -1;
@@ -286,6 +302,33 @@ void take_scheduled_photo(void)
     wifi_power_on(); 
 }
 
+void format_sd_card(void) 
+{
+    ESP_LOGW(TAG, "[!!!] Запущено форматирование SD-карты...");
+    sdmmc_card_t* card;
+    
+    if (init_sd_card(&card) == ESP_OK) {
+        MKFS_PARM format_opt = { .fmt = FM_ANY, .au_size = 0, .align = 0, .n_fat = 2, .n_root = 512 };
+        FRESULT fr = f_mkfs("0:", &format_opt, NULL, 1024); 
+        
+        if (fr == FR_OK) {
+            ESP_LOGW(TAG, "[+] SD-карта успешно очищена и отформатирована под новый стандарт!");
+            boot_count = 0; // Сбрасываем локальный счетчик фото в 0
+            last_sent_index = 0; // Обнуляем индекс отправки
+            
+            // Сразу же создаем чистый файл конфигурации на новой ФС
+            FILE *f = fopen(INDEX_FILE_PATH, "w");
+            if (f) {
+                fprintf(f, "0");
+                fclose(f);
+            }
+        } else {
+            ESP_LOGE(TAG, "Ошибка форматирования нового API FatFS: %d", fr);
+        }
+        esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
+    }
+}
+
 void app_main(void) {
     global_start_time = esp_timer_get_time();
 	gpio_config_t io_conf = { .pin_bit_mask = (1ULL << 48), .mode = GPIO_MODE_OUTPUT, .pull_up_en = 0, .pull_down_en = 1 };
@@ -364,7 +407,12 @@ void app_main(void) {
 		ESP_LOGE(TAG, "[-] Сеть недоступна. Кадр %05d остался в очереди.", boot_count);
 	}
 	// Сюда плата попадет ТОЛЬКО тогда, когда вся очередь будет успешно отправлена!
+	
 	esp_wifi_stop();
+    if (format_requested) {
+        format_requested = false;
+        format_sd_card();
+    }
 	gpio_hold_en(GPIO_NUM_48);
 	esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
 	uint64_t session_time_us = esp_timer_get_time() - global_start_time;
