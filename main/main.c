@@ -26,6 +26,11 @@
 #include "lwip/sys.h"
 #include <lwip/netdb.h>
 
+// Файлы проекта
+#include "ota_update.h" 
+#include "adc.h"
+
+
 static const char *TAG = "greenhouse_cam";
 
 #define WIFI_SSID           "SamstillingHeimar" // Если раздаете со смартфона - укажите имя точки телефона
@@ -140,7 +145,8 @@ bool wifi_power_on(void) {
     return (bits & WIFI_CONNECTED_BIT) ? true : false;
 }
 
-bool send_buffer_to_server(uint8_t *buf, size_t len, int index) {
+bool send_buffer_to_server(uint8_t *buf, size_t len, int index) 
+{
     struct sockaddr_in dest_addr;
     dest_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
     dest_addr.sin_family = AF_INET;
@@ -149,13 +155,17 @@ bool send_buffer_to_server(uint8_t *buf, size_t len, int index) {
     int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
     if (sock < 0) return false;
 
-    struct timeval timeout = { .tv_sec = 4, .tv_usec = 0 };
+    struct timeval timeout = { .tv_sec = 6, .tv_usec = 0 };
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
     if (connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) != 0) { close(sock); return false; }
 
-    uint32_t header[2] = { (uint32_t)index, (uint32_t)len };
+    // Измеряем заряд батареи перед отправкой
+    uint32_t bat_mv = read_battery_millivolts();
+
+    // Отправляем ОБНОВЛЕННЫЙ 12-БАЙТОВЫЙ ЗАГОЛОВОК (Индекс + Длина + Батарея)
+    uint32_t header[3] = { (uint32_t)index, (uint32_t)len, bat_mv };
     if (send(sock, header, sizeof(header), 0) < 0) { close(sock); return false; }
 
     if (len > 0) {
@@ -168,10 +178,31 @@ bool send_buffer_to_server(uint8_t *buf, size_t len, int index) {
         }
     }
 
-    int32_t rx_index = -1;
-    int rx_len = recv(sock, &rx_index, sizeof(rx_index), 0);
-    if (rx_len == sizeof(rx_index)) {
-        server_requested_index = rx_index;
+    // СЛУШАЕМ СИНХРОНИЗАЦИЮ И КОМАНДЫ ОТ СМАРТФОНА
+    // Сервер может прислать либо 4 байта (номер индекса), либо текстовую команду "OTA:Размер"
+    char rx_buf[64] = {0};
+    int rx_len = recv(sock, rx_buf, sizeof(rx_buf) - 1, 0);
+    
+    if (rx_len > 0) {
+        if (strncmp(rx_buf, "OTA:", 4) == 0) {
+            size_t ota_file_size = atoi(&rx_buf[4]);
+            if (ota_file_size > 0) {
+                send(sock, "READY", 5, 0);
+                if (perform_tcp_ota(sock, ota_file_size)) {
+                    close(sock);
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    esp_restart(); 
+                }
+            }
+        } else if (rx_len == 4) {
+            // Читаем 4 байта знакового инта напрямую
+            int32_t rx_index = -1;
+            memcpy(&rx_index, rx_buf, 4);
+            
+            // Просто сохраняем то, что прислал сервер. 
+            // Если пришло -1, это запишется в server_requested_index
+            server_requested_index = rx_index;
+        }
     }
 
     close(sock);
@@ -192,34 +223,36 @@ int get_last_file_index_from_sd(void) {
 }
 
 // Функция ДИНАМИЧЕСКОГО ночного режима (включается только при глубоких сумерках)
-void apply_smart_camera_settings(void) {
+void apply_smart_camera_settings(void) 
+{
     sensor_t *s = esp_camera_sensor_get();
     if (!s || s->id.PID != OV3660_PID) return;
 
-    s->set_whitebal(s, 1);       
-    s->set_exposure_ctrl(s, 1);  
-    s->set_gain_ctrl(s, 1);      
-    s->set_agc_gain(s, 30);      
-
-    // Читаем текущее значение автоматической выдержки матрицы. 
-    // Если на улице темно, внутренние регистры AEC будут на максимуме.
-    // Если темно — включаем аппаратный ночной удлиненный режим. Если светло — жестко выключаем пересвет!
-    int current_aec = s->get_reg(s, 0x3501, 0xff); 
-    if (current_aec > 0x80) { 
-        ESP_LOGW(TAG, "[!] Обнаружены сумерки. Активация Night Mode.");
+//    s->set_whitebal(s, 1);       
+//    s->set_exposure_ctrl(s, 1);  
+//    s->set_gain_ctrl(s, 1);      
+//    s->set_agc_gain(s, 30);      
+//
+//    // Читаем текущее значение автоматической выдержки матрицы. 
+//    // Если на улице темно, внутренние регистры AEC будут на максимуме.
+//    // Если темно — включаем аппаратный ночной удлиненный режим. Если светло — жестко выключаем пересвет!
+//    int current_aec = s->get_reg(s, 0x3501, 0xff); 
+//    if (current_aec > 0x80) { 
+//        ESP_LOGW(TAG, "[!] Обнаружены сумерки. Активация Night Mode.");
         s->set_reg(s, 0x3a00, 0xff, 0x04); // Медленный FPS, длинное накопление света
         s->set_reg(s, 0x3a14, 0xff, 0x03); 
         s->set_reg(s, 0x3a15, 0xff, 0x00); 
-        s->set_ae_level(s, 2); 
-    } else {
-        ESP_LOGI(TAG, "[+] День. Дневной режим зафиксирован (Защита от пересветов).");
-        s->set_reg(s, 0x3a00, 0xff, 0x00); // Обычный быстрый затвор
-        s->set_ae_level(s, 0); 
-    }
+//        s->set_ae_level(s, 2); 
+//    } else {
+//        ESP_LOGI(TAG, "[+] День. Дневной режим зафиксирован (Защита от пересветов).");
+//        s->set_reg(s, 0x3a00, 0xff, 0x00); // Обычный быстрый затвор
+//        s->set_ae_level(s, 0); 
+//    }
 }
 
 // Вынесенная функция съемки планового кадра посреди очереди
-void take_scheduled_photo(void) {
+void take_scheduled_photo(void) 
+{
     boot_count++;
     ESP_LOGW(TAG, "[!!!] Наступило время планового снимка. Съемка кадра №%d по графику...", boot_count);
     
@@ -228,7 +261,7 @@ void take_scheduled_photo(void) {
     vTaskDelay(pdMS_TO_TICKS(100));
 
     esp_camera_init(&camera_config);
-    //apply_smart_camera_settings();
+    apply_smart_camera_settings();
     vTaskDelay(pdMS_TO_TICKS(1200)); 
 
     for (int i = 0; i < 2; i++) {
@@ -269,12 +302,19 @@ void app_main(void) {
     esp_wifi_stop(); 
 	if (wifi_power_on()) {
 		ESP_LOGI(TAG, "[+] Сеть активна. Синхронизация индексов с сервером...");
-		uint8_t dummy = 0;
-		send_buffer_to_server(&dummy, 0, boot_count);
-		if (server_requested_index != -1) {
-			last_sent_index = server_requested_index;
-			write_last_sent_index_to_sd(last_sent_index);
-		}
+        uint8_t dummy = 0;
+        server_requested_index = -1; // Сбрасываем перед запросом
+        send_buffer_to_server(&dummy, 0, boot_count);
+        
+        // Логика DUMP и синхронизации теперь вынесена сюда:
+        if (server_requested_index == -1) {
+            ESP_LOGW(TAG, "[!] Сервер запросил полную выгрузку (DUMP)! Начинаем с 1 кадра.");
+        } else {
+            last_sent_index = server_requested_index;
+            write_last_sent_index_to_sd(last_sent_index);
+            ESP_LOGW(TAG, "[*] Синхронизация успешна! Сервер ждет файлы с №%d", last_sent_index + 1);
+        }
+		
 		// ПОТОКОВЫЙ ЦИКЛ БЕЗ СНА: гоним файлы, пока очередь не опустеет совсем
 		while (last_sent_index < boot_count) {
 			// КРИТИЧЕСКИЙ ПРЕДОХРАНИТЕЛЬ ХРОНОМЕТРАЖА:
