@@ -241,9 +241,9 @@ int get_last_file_index_from_sd(void) {
 // Функция ДИНАМИЧЕСКОГО ночного режима (включается только при глубоких сумерках)
 void apply_smart_camera_settings(void) 
 {
-    sensor_t *s = esp_camera_sensor_get();
-    if (!s || s->id.PID != OV3660_PID) return;
-
+//    sensor_t *s = esp_camera_sensor_get();
+//    if (!s || s->id.PID != OV3660_PID) return;
+//
 //    s->set_whitebal(s, 1);       
 //    s->set_exposure_ctrl(s, 1);  
 //    s->set_gain_ctrl(s, 1);      
@@ -255,9 +255,9 @@ void apply_smart_camera_settings(void)
 //    int current_aec = s->get_reg(s, 0x3501, 0xff); 
 //    if (current_aec > 0x80) { 
 //        ESP_LOGW(TAG, "[!] Обнаружены сумерки. Активация Night Mode.");
-        s->set_reg(s, 0x3a00, 0xff, 0x04); // Медленный FPS, длинное накопление света
-        s->set_reg(s, 0x3a14, 0xff, 0x03); 
-        s->set_reg(s, 0x3a15, 0xff, 0x00); 
+//        s->set_reg(s, 0x3a00, 0xff, 0x04); // Медленный FPS, длинное накопление света
+//        s->set_reg(s, 0x3a14, 0xff, 0x03); 
+//        s->set_reg(s, 0x3a15, 0xff, 0x00); 
 //        s->set_ae_level(s, 2); 
 //    } else {
 //        ESP_LOGI(TAG, "[+] День. Дневной режим зафиксирован (Защита от пересветов).");
