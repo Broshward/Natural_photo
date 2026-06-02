@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img_lib;
+import 'package:path_provider/path_provider.dart';
 
 void main() {
   runApp(const MyApp());
@@ -30,67 +31,79 @@ class GreenhouseScreen extends StatefulWidget {
 
 class _GreenhouseScreenState extends State<GreenhouseScreen> {
   ServerSocket? _serverSocket;
-  Uint8List? _jpegBytes; // Сюда мы будем класть готовый для вывода на экран JPEG
+  Uint8List? _jpegBytes; 
   
-  String _statusText = "Статус: Слушаю порт 8888...";
+  String _statusText = "Статус: Ожидание теплицы...";
   String _batteryText = "Батарея: -- V (--%)";
-  String _queueText = "Кадр в очереди: --";
+  String _queueText = "[OK] Железо платы исправно";
   
   bool _formatRequested = false;
   bool _otaMode = false;
-  int _formatStage = 0;
-  int _countdown = 5;
-  Timer? _countdownTimer;
+  
+  final TextEditingController _dialogController = TextEditingController();
 
   @override
   void initState() {
     super.initState();
-    _startTcpServer(); // Сервер запускается автоматически при старте приложения!
+    _startTcpServer(); 
   }
 
   @override
   void dispose() {
-    _serverSocket?.close(); // Жестко и безопасно освобождаем порт при закрытии
-    _countdownTimer?.cancel();
+    _serverSocket?.close(); 
+    _dialogController.dispose();
     super.dispose();
   }
 
-  // === ВЫСОКОСКОРОСТНОЙ КОНВЕРТЕР YUV422 PACKED -> JPEG (На чистом Dart) ===
   Uint8List convertYuv422ToJpeg(Uint8List yuvBytes, int width, int height) {
-    // Создаем пустой холст в памяти смартфона средствами библиотеки image
     final image = img_lib.Image(width: width, height: height);
-
     int yuvIdx = 0;
-    // OV3660 шлет данные YUV422 packed. Пробегаем по макропикселям (2 пикселя за шаг)
     for (int r = 0; r < height; r++) {
       for (int c = 0; c < width; c += 2) {
         if (yuvIdx + 3 >= yuvBytes.length) break;
 
-        // Извлекаем компоненты (с учетом нашего Си-переворота хроматики на плате)
         int y0 = yuvBytes[yuvIdx];
-        int v  = yuvBytes[yuvIdx + 1];
-        int u  = yuvBytes[yuvIdx + 2];
-        int y1 = yuvBytes[yuvIdx + 3];
+        int u  = yuvBytes[yuvIdx + 1]; 
+        int y1 = yuvBytes[yuvIdx + 2];
+        int v  = yuvBytes[yuvIdx + 3];
         yuvIdx += 4;
 
-        // Математика пересчета YUV в RGB для первого пикселя
-        int r0 = (y0 + 1.402 * (v - 128)). roundtable();
-        int g0 = (y0 - 0.344136 * (u - 128) - 0.714136 * (v - 128)). roundtable();
-        int b0 = (y0 + 1.772 * (u - 128)). roundtable();
+        int r0 = (y0 + 1.402 * (v - 128)).round();
+        int g0 = (y0 - 0.344136 * (u - 128) - 0.714136 * (v - 128)).round();
+        int b0 = (y0 + 1.772 * (u - 128)).round();
 
-        // Для второго пикселя
-        int r1 = (y1 + 1.402 * (v - 128)). roundtable();
-        int g1 = (y1 - 0.344136 * (u - 128) - 0.714136 * (v - 128)). roundtable();
-        int b1 = (y1 + 1.772 * (u - 128)). roundtable();
+        int r1 = (y1 + 1.402 * (v - 128)).round();
+        int g1 = (y1 - 0.344136 * (u - 128) - 0.714136 * (v - 128)).round();
+        int b1 = (y1 + 1.772 * (u - 128)).round();
 
-        // Записываем пиксели в структуру холста Flutter
         image.setPixelRgb(c, r, r0.clamp(0, 255), g0.clamp(0, 255), b0.clamp(0, 255));
         image.setPixelRgb(c + 1, r, r1.clamp(0, 255), g1.clamp(0, 255), b1.clamp(0, 255));
       }
     }
+    return Uint8List.fromList(img_lib.encodeJpg(image, quality: 90));
+  }
 
-    // Кодируем холст в стандартный сжатый JPEG поток байт
-    return Uint8List.fromList(img_lib.encodeJpg(image, quality: 85));
+  // РЕШЕНИЕ ПРОБЛЕМЫ СИНХРОНИЗАЦИИ: Сканируем папку по динамическому пути песочницы!
+  Future<int> get_max_saved_index() async {
+    int maxIndex = 0;
+    try {
+      final extDir = await getExternalStorageDirectory();
+      if (extDir != null) {
+        final rootDir = Directory('${extDir.path}/greenhouse_archive');
+        if (await rootDir.exists()) {
+          final files = rootDir.listSync();
+          for (var file in files) {
+            if (file is File && file.path.endsWith(".jpg")) {
+              final name = file.path.split('/').last.split('.').first;
+              final idx = int.tryParse(name) ?? 0;
+              if (idx > maxIndex) maxIndex = idx;
+            }
+          }
+        }
+      }
+    } catch (_) {}
+    print("[*] Сервер проверил диск. Максимальный индекс: $maxIndex");
+    return maxIndex;
   }
 
   void _startTcpServer() async {
@@ -100,183 +113,276 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
         _handleEsp32Connection(client);
       });
     } catch (e) {
-      setState(() { _statusText = "Ошибка запуска порта 8888: $e"; });
+      setState(() { _statusText = "Ошибка порта 8888: $e"; });
     }
   }
 
-  void _handleEsp32Connection(Socket client) async {
-    List<int> dataBuffer = [];
-    int imgIndex = 0;
-    int imgSize = 0;
-    int batMv = 0;
-    bool headerParsed = false;
+  // ЛИНЕЙНЫЙ ДИСПЕТЧЕР С ПОШАГОВЫМ ОЖИДАНИЕМ БУФЕРА
+    void _handleEsp32Connection(Socket client) async {
+    client.timeout(const Duration(seconds: 35)); 
+    final iterator = StreamIterator<Uint8List>(client);
+    List<int> currentBuffer = [];
 
-    client.listen((Uint8List packet) async {
-      dataBuffer.addAll(packet);
+    try {
+      while (currentBuffer.length < 16) {
+        if (!await iterator.moveNext()) break;
+        currentBuffer.addAll(iterator.current);
+      }
 
-      // 1. Парсим 12-байтовый заголовок, как только накопилось достаточно байт
-      if (!headerParsed && dataBuffer.length >= 12) {
-        final bd = ByteData.sublistView(Uint8List.fromList(dataBuffer.sublist(0, 12)));
-        imgIndex = bd.getUint32(0, Endian.little);
-        imgSize = bd.getUint32(4, Endian.little);
-        batMv = bd.getUint32(8, Endian.little);
-        headerParsed = true;
+      if (currentBuffer.length < 16) {
+        await client.close();
+        iterator.cancel();
+        return;
+      }
 
-        // Считаем вольтаж лития
-        double batV = batMv / 1000.0;
-        int batPct = (((batV - 3.5) / (4.2 - 3.5)) * 100).clamp(0, 100).toInt();
+      final bd = ByteData.sublistView(Uint8List.fromList(currentBuffer.sublist(0, 16)));
+      int imgIndex = bd.getUint32(0, Endian.little);
+      int imgSize = bd.getUint32(4, Endian.little);
+      int batMv = bd.getUint32(8, Endian.little);
+      int freeSpaceMb = bd.getUint32(12, Endian.little);
 
+      double batV = batMv / 1000.0;
+      int batPct = (((batV - 3.5) / (4.2 - 3.5)) * 100).clamp(0, 100).toInt();
+      double freeGb = freeSpaceMb / 1024.0;
+
+      // СЦЕНАРИЙ А: Холостой пинг синхронизации
+      if (imgSize == 0) {
+        int errorMask = imgIndex; 
+        String hardwareLog = "[OK] Железо платы исправно";
+        if (errorMask > 0) {
+          List<String> errorsList = [];
+          if ((errorMask & 0x01) != 0) errorsList.add("Сбой Инит Камеры");
+          if ((errorMask & 0x02) != 0) errorsList.add("Пустой кадр матрицы");
+          if ((errorMask & 0x04) != 0) errorsList.add("Карта SD неисправна");
+          hardwareLog = "[Авария]: ${errorsList.join(', ')}";
+        }
+
+        String storageStr = freeSpaceMb > 0 ? "Карта: ${freeGb.toStringAsFixed(2)} ГБ свободно" : "Карта: Неисправна или Отформатирована";
         setState(() {
-          _queueText = "Кадр в очереди: ${imgIndex.toString().padLeft(5, '0')}";
-          _batteryText = batMv > 0 ? "Батарея: ${batV.toStringAsFixed(2)} V ($batPct%)" : "Батарея: USB питание";
-          _statusText = "Соединение установлено. Прием данных...";
+          _queueText = hardwareLog; 
+          _batteryText = batMv > 0 ? "Батарея: ${batV.toStringAsFixed(2)} V ($batPct%)" : "Батарея: USB";
+          _statusText = storageStr;
         });
 
-        // СЦЕНАРИЙ А: Холостой пинг синхронизации
-        if (imgSize == 0) {
-          if (_otaMode) {
-            // Режим прошивки (пока заглушка, возвращаем OK)
-            client.write("OTA_ERR");
-            _otaMode = false;
-          } else if (_formatRequested) {
-            client.write("FORMAT_SD\n");
-            _formatRequested = false;
-            setState(() { _statusText = "Флешка на плате успешно очищена!"; });
-          } else {
-            // Шлем плате 0 (или любой индекс из локальной истории, пока шлем 0)
-            final resp = ByteData(4)..setInt32(0, 0, Endian.little);
-            client.add(resp.buffer.asUint8List());
+        if (_otaMode) {
+          // === КРИСТАЛЬНО СИНХРОННЫЙ ОТА ПОТОК ИЗ ЛЕГАЛЬНОЙ ПАПКИ ===
+          final extDir = await getExternalStorageDirectory();
+          if (extDir != null) {
+            final otaFile = File('${extDir.path}/greenhouse_archive/firmware.bin');
+            
+            if (otaFile.existsSync()) {
+              int otaSize = otaFile.lengthSync();
+              
+              client.add(Uint8List.fromList("OTA:$otaSize".codeUnits));
+              await client.flush(); 
+              print("[*] Команда OTA:$otaSize успешно отправлена.");
+
+              currentBuffer = currentBuffer.sublist(16);
+              while (!currentBuffer.contains(82) || !currentBuffer.contains(89)) { 
+                if (!await iterator.moveNext()) break;
+                currentBuffer.addAll(iterator.current);
+              }
+
+              print("[+] Си-сигнал READY подтвержден. Заливка бинарника...");
+              setState(() { _statusText = "Передача прошивки по воздуху..."; });
+              
+              final binaryBytes = otaFile.readAsBytesSync(); // Читаем синхронно без Permission Denied!
+              client.add(binaryBytes);
+              await client.flush(); 
+              
+              print("[+] Прошивка полностью улетела в плату!");
+              setState(() { _otaMode = false; _statusText = "Прошивка успешно загружена! Плата ребутается."; });
+            } else {
+              client.write("OTA_ERR"); await client.flush(); _otaMode = false;
+              setState(() { _statusText = "Файл firmware.bin не найден в greenhouse_archive!"; });
+            }
           }
-          client.close();
+          await client.close();
+          iterator.cancel();
+          return;
+        } else if (_formatRequested) {
+          client.add(Uint8List.fromList("FORMAT_SD\n".codeUnits)); await client.flush();
+          _formatRequested = false;
+          setState(() { _statusText = "Сигнал форматирования передан на плату!"; });
+          await client.close();
+          iterator.cancel();
+          return;
+        } else {
+          int maxSavedIdx = await get_max_saved_index();
+          final resp = ByteData(4)..setInt32(0, maxSavedIdx, Endian.little);
+          client.add(resp.buffer.asUint8List());
+          await client.flush();
+          await client.close();
+          iterator.cancel();
           return;
         }
-        
-        // Удаляем заголовок из буфера, оставляя только чистые байты картинки
-        dataBuffer = dataBuffer.sublist(12);
       }
 
-      // 2. Прием тела картинки
-      if (headerParsed && imgSize > 0 && dataBuffer.length >= imgSize) {
-        final rawYuvBytes = Uint8List.fromList(dataBuffer.sublist(0, imgSize));
-        
-        // Запускаем наш высокоскоростной Dart-конвертер YUV422 -> JPEG
+      // СЦЕНАРИЙ Б: Прием бинарного тела кадра YUV422
+      if (imgSize > 0) {
+        List<int> imagePayload = currentBuffer.sublist(16);
+        while (imagePayload.length < imgSize) {
+          if (!await iterator.moveNext()) break;
+          imagePayload.addAll(iterator.current);
+        }
+
+        print("[*] Буфер кадра собран. Принято: ${imagePayload.length} байт.");
+
+        final rawYuvBytes = Uint8List.fromList(imagePayload.sublist(0, imgSize));
         final convertedJpeg = convertYuv422ToJpeg(rawYuvBytes, 1024, 768);
 
+        try {
+          final extDir = await getExternalStorageDirectory();
+          if (extDir != null) {
+            final greenhouseFolder = Directory('${extDir.path}/greenhouse_archive');
+            if (!greenhouseFolder.existsSync()) greenhouseFolder.createSync(recursive: true);
+            
+            final fileStringIndex = imgIndex.toString().padLeft(5, '0');
+            final file = File('${greenhouseFolder.path}/$fileStringIndex.jpg');
+            await file.writeAsBytes(convertedJpeg); 
+          }
+        } catch (e) { print("Ошибка записи кадра: $e"); }
+
         setState(() {
-          _jpegBytes = convertedJpeg; // Помещаем байты в стейт — экран обновится мгновенно!
-          _statusText = "Успешно принят кадр ${imgIndex.toString().padLeft(5, '0')}";
+          _jpegBytes = convertedJpeg;
+          _statusText = "Успешно зафиксирован кадр №${imgIndex.toString().padLeft(5, '0')}";
         });
 
-        // Отправляем плате Си-подтверждение (4 байта индекса кадра обратно)
         final ack = ByteData(4)..setInt32(0, imgIndex, Endian.little);
         client.add(ack.buffer.asUint8List());
-        client.close();
+        await client.flush();
+        await client.close();
+        iterator.cancel();
       }
-    }, onError: (e) {
-      setState(() { _statusText = "Ошибка сессии: $e"; });
-      client.close();
-    }, onDone: () {
-      client.close();
-    });
-  }
 
-  void _triggerFormatSecure() {
-    if (_formatStage == 0) {
-      setState(() {
-        _formatStage = 1;
-        _countdown = 5;
-      });
-      _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-        setState(() {
-          _countdown--;
-          if (_countdown <= 0) {
-            _formatStage = 0;
-            _countdownTimer?.cancel();
-          }
-        });
-      });
-    } else if (_formatStage == 1) {
-      _countdownTimer?.cancel();
-      setState(() {
-        _formatStage = 0;
-        _formatRequested = true;
-        _statusText = "Запрос на форматирование взведен. Ожидание платы...";
-      });
+    } catch (e) {
+      setState(() { _statusText = "Сбой сессии: $e"; });
+      try { await client.close(); } catch (_) {}
+      iterator.cancel();
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Greenhouse Control Пульт')),
-      body: Padding(
-        padding: const EdgeInsets.all(12.0),
-        child: Column(
+  void _showFormatDialog() {
+    _dialogController.clear();
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Очистка флешки теплицы"),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            // Окно вывода картинки
-            Expanded(
-              child: Container(
-                width: double.infinity,
-                decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(8)),
-                child: _jpegBytes != null
-                    ? Image.memory(_jpegBytes!, fit: BoxFit.contain)
-                    : const Center(child: Text("Ожидание первого кадра...", style: TextStyle(color: Colors.grey))),
-              ),
-            ),
-            const SizedBox(height: 15),
-            // Информационный блок
-            Text(_statusText, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 5),
-            Text(_batteryText, style: const TextStyle(fontSize: 15, color: Colors.greenAccent)),
-            const SizedBox(height: 5),
-            Text(_queueText, style: const TextStyle(fontSize: 14, color: Colors.white70)),
-            const SizedBox(height: 15),
-            
-            // Двухэтапная защищенная кнопка очистки флешки
-            SizedBox(
-              width: double.infinity,
-              height: 50,
-              child: ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: _formatStage == 1 ? Colors.red : Colors.grey[700],
-                ),
-                onPressed: _triggerFormatSecure,
-                child: Text(
-                  _formatStage == 1 
-                      ? "ВЫ УВЕРЕНЫ? НАЖМИТЕ ЕЩЕ РАЗ ($_countdown)" 
-                      : "ОЧИСТИТЬ ФЛЭШКУ НА ПЛАТЕ",
-                  style: const TextStyle(fontSize: 15, color: Colors.white),
-                ),
-              ),
-            ),
-            const SizedBox(height: 10),
-            
-            // Кнопка режима OTA
-            SizedBox(
-              width: double.infinity,
-              height: 45,
-              child: OutlinedButton(
-                style: OutlinedButton.styleFrom(
-                  side: BorderSide(color: _otaMode ? Colors.blue : Colors.red),
-                  backgroundColor: _otaMode ? Colors.blue.withOpacity(0.2) : Colors.transparent,
-                ),
-                onPressed: () {
-                  setState(() { _otaMode = !_otaMode; });
-                },
-                child: Text(
-                  _otaMode ? "ОБНОВЛЕНИЕ ПО: ОЖИДАНИЕ ПЛАТЫ..." : "ОБНОВЛЕНИЕ ПРОШИВКИ: ВЫКЛ",
-                  style: TextStyle(color: _otaMode ? Colors.blue : Colors.red),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
+          const Text("Эта операция полностью сотрет все файлы на SD-карте платы. Данное действие необратимо!"),
+const SizedBox(height: 15),
+TextField(
+controller: _dialogController,
+decoration: const InputDecoration(labelText: "Введите проверочное слово 'format'"),
+)
+],
+),
+actions: [
+TextButton(onPressed: () => Navigator.pop(context), child: const Text("ОТМЕНА")),
+ElevatedButton(
+style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+onPressed: () {
+if (_dialogController.text.trim().toLowerCase() == "format") {
+setState(() { _formatRequested = true; _statusText = "Запрос очистки взведен. Ожидание платы..."; });
+Navigator.pop(context);
+}
+},
+child: const Text("СТЕРЕТЬ ВСЁ"),
+)
+],
+),
+);
 }
 
-// Вспомогательное расширение для округления double в Си стилизации
-extension DoubleRound on double {
-  int roundtable() => round();
+  void _showOtaDialog() {
+    _dialogController.clear();
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Обновление прошивки по воздуху"),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text("Скопируйте файл 'firmware.bin' с помощью Cx Проводника в папку приложения: Android/data/com.example.greenhouse_control_flutter/files/greenhouse_archive/"),
+            const SizedBox(height: 15),
+            TextField(
+              controller: _dialogController,
+              decoration: const InputDecoration(labelText: "Введите проверочное слово 'firmware'"),
+            )
+          ],
+        ),
+
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("ОТМЕНА")),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
+            onPressed: () {
+            if (_dialogController.text.trim().toLowerCase() == "firmware") {
+              setState(() { _otaMode = true; _statusText = "Режим OTA активен. Ожидание платы..."; });
+              Navigator.pop(context);
+            }
+          },
+          child: const Text("ОБНОВИТЬ ПО"),
+        )
+      ],
+    ),
+  );
+}
+
+@override
+Widget build(BuildContext context) {
+return Scaffold(
+appBar: AppBar(title: const Text('Greenhouse Control Пульт')),
+body: Padding(
+padding: const EdgeInsets.all(12.0),
+child: Column(
+children: [
+Expanded(
+child: Container(
+width: double.infinity,
+decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(8)),
+child: _jpegBytes != null
+? Image.memory(_jpegBytes!, fit: BoxFit.contain)
+: const Center(child: Text("Ожидание теплицы...", style: TextStyle(color: Colors.grey))),
+),
+),
+const SizedBox(height: 15),
+Text(_statusText, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold), textAlign: TextAlign.center),
+const SizedBox(height: 5),
+Text(_queueText, style: TextStyle(fontSize: 15, color: _queueText.contains("Авария") ? Colors.redAccent : Colors.white70, fontWeight: _queueText.contains("Авария") ? FontWeight.bold : FontWeight.normal)),
+const SizedBox(height: 5),
+Text(_batteryText, style: const TextStyle(fontSize: 15, color: Colors.greenAccent)),
+const SizedBox(height: 15),
+SizedBox(
+width: double.infinity,
+height: 48,
+child: ElevatedButton(
+style: ElevatedButton.styleFrom(backgroundColor: Colors.grey),
+onPressed: _showFormatDialog,
+child: const Text("ОЧИСТИТЬ ФЛЭШКУ НА ПЛАТЕ", style: TextStyle(fontSize: 14, color: Colors.white)),
+),
+),
+const SizedBox(height: 10),
+SizedBox(
+width: double.infinity,
+height: 44,
+child: OutlinedButton(
+style: OutlinedButton.styleFrom(
+side: BorderSide(color: _otaMode ? Colors.blue : Colors.redAccent),
+backgroundColor: _otaMode ? Colors.blue.withOpacity(0.1) : Colors.transparent,
+),
+onPressed: _showOtaDialog,
+child: Text(
+_otaMode ? "ОБНОВЛЕНИЕ ПО: В ЖДУЩЕМ РЕЖИМЕ..." : "ОБНОВИТЬ ПРОШИВКУ (OTA)",
+style: TextStyle(color: _otaMode ? Colors.blue : Colors.redAccent, fontWeight: FontWeight.bold),
+),
+),
+),
+],
+),
+),
+);
+}
 }

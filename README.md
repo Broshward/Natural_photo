@@ -61,3 +61,40 @@ An automated, ultra-low-power greenhouse monitoring camera system built from scr
    ```
    *Note: The built-in ESP-IDF Component Manager will automatically parse `idf_component.yml` and fetch the certified version of `espressif/esp32-camera` directly into your local workspace on the first run.*
 
+## Mobile Remote App (Flutter / Dart)
+
+The repository contains a native Android mobile control unit located in the `greenhouse_control_flutter/` directory. It operates as a synchronous, blocking TCP single-thread server that handles dynamic storage indexing, battery telemetry rendering, secure hardware alerts logging, and direct over-the-air firmware binaries uploading.
+
+### Mobile App Hardware Permissions
+The app runs safely under Android 11-14 (Scoped Storage compliant) without requesting global disk monitoring tokens.
+* **Firmware updates storage:** `/storage/emulated/0/Download/firmware.bin`
+* **Greenhouse Photo Archive:** Isolated inside application sandboxed environment: `Android/data/com.example.greenhouse_control_flutter/files/greenhouse_archive/` (accessible via advanced file managers like Cx File Explorer).
+
+### How to Build the Android APK
+
+1. Ensure the Flutter SDK is installed and verified on your Linux development system:
+   ```bash
+   flutter doctor
+   ```
+
+2. Navigate to the mobile app component directory:
+   ```bash
+   cd greenhouse_control_flutter
+   ```
+
+3. Download the necessary high-speed image processing packages and providers:
+   ```bash
+   flutter pub get
+   ```
+
+4. Connect your Android smartphone via USB with "USB Debugging" toggled on, and boot a live debug session:
+   ```bash
+   flutter run
+   ```
+
+5. Compile a high-performance standalone release binary package (`.apk`) for deployment:
+   ```bash
+   flutter build apk --release
+   ```
+   *The compiled production package will be successfully generated at:* `build/app/outputs/flutter-apk/app-release.apk`
+
