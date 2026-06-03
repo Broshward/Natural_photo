@@ -16,7 +16,6 @@
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
 #include "driver/gpio.h"
-#include "esp_adc/adc_oneshot.h"
 #include "ff.h"
 
 // Сеть и OTA
@@ -25,6 +24,8 @@
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 #include "ota_update.h"
+
+#include "adc.h"
 
 static const char *TAG = "greenhouse_cam";
 
@@ -67,14 +68,31 @@ static uint32_t hardware_errors_mask = 0;
 
 
 static camera_config_t camera_config = {
-    .pin_pwdn = -1, .pin_reset = -1, .pin_xclk = XCLK_GPIO_NUM,
-    .pin_sccb_sda = SIOD_GPIO_NUM, .pin_sccb_scl = SIOC_GPIO_NUM,
-    .pin_d7 = Y9_GPIO_NUM, .pin_d6 = Y8_GPIO_NUM, .pin_d5 = Y7_GPIO_NUM, .pin_d4 = Y6_GPIO_NUM,
-    .pin_d3 = Y5_GPIO_NUM, .pin_d2 = Y4_GPIO_NUM, .pin_d1 = Y3_GPIO_NUM, .pin_d0 = Y2_GPIO_NUM,
-    .pin_vsync = VSYNC_GPIO_NUM, .pin_href = HREF_GPIO_NUM, .pin_pclk = PCLK_GPIO_NUM,
-    .xclk_freq_hz = 24000000, .ledc_timer = LEDC_TIMER_0, .ledc_channel = LEDC_CHANNEL_0,
-    .pixel_format = PIXFORMAT_YUV422, .frame_size = FRAMESIZE_XGA,
-    .jpeg_quality = 12, .fb_count = 1, .grab_mode = CAMERA_GRAB_WHEN_EMPTY, .fb_location = CAMERA_FB_IN_PSRAM    
+    .pin_pwdn = -1, 
+	.pin_reset = -1,
+	.pin_xclk = XCLK_GPIO_NUM,
+    .pin_sccb_sda = SIOD_GPIO_NUM,
+	.pin_sccb_scl = SIOC_GPIO_NUM,
+    .pin_d7 = Y9_GPIO_NUM,
+	.pin_d6 = Y8_GPIO_NUM,
+	.pin_d5 = Y7_GPIO_NUM,
+	.pin_d4 = Y6_GPIO_NUM,
+    .pin_d3 = Y5_GPIO_NUM,
+	.pin_d2 = Y4_GPIO_NUM,
+	.pin_d1 = Y3_GPIO_NUM,
+	.pin_d0 = Y2_GPIO_NUM,
+    .pin_vsync = VSYNC_GPIO_NUM, 
+	.pin_href = HREF_GPIO_NUM,
+	.pin_pclk = PCLK_GPIO_NUM,
+    .xclk_freq_hz = 24000000,
+	.ledc_timer = LEDC_TIMER_0,
+	.ledc_channel = LEDC_CHANNEL_0,
+    .pixel_format = PIXFORMAT_YUV422,
+	.frame_size = FRAMESIZE_XGA,
+    .jpeg_quality = 12,
+	.fb_count = 1,
+	.grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+	.fb_location = CAMERA_FB_IN_PSRAM    
 };
 
 static esp_err_t init_sd_card(sdmmc_card_t** out_card) {
@@ -84,20 +102,6 @@ static esp_err_t init_sd_card(sdmmc_card_t** out_card) {
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
     slot_config.width = 1; slot_config.clk = GPIO_NUM_39; slot_config.cmd = GPIO_NUM_38; slot_config.d0  = GPIO_NUM_40;
     return esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot_config, &mount_config, out_card);
-}
-
-uint32_t read_battery_millivolts(void) {
-    int adc_raw = 0;
-    adc_oneshot_unit_handle_t adc1_handle;
-    adc_oneshot_unit_init_cfg_t init_config = { .unit_id = ADC_UNIT_1 };
-    if (adc_oneshot_new_unit(&init_config, &adc1_handle) == ESP_OK) {
-        adc_oneshot_chan_cfg_t config = { .bitwidth = ADC_BITWIDTH_DEFAULT, .atten = ADC_ATTEN_DB_12 };
-        adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_0, &config);
-        adc_oneshot_read(adc1_handle, ADC_CHANNEL_0, &adc_raw);
-        adc_oneshot_del_unit(adc1_handle);
-    }
-    uint32_t mv = ((uint32_t)adc_raw * 2600 * 2) / 4095;
-    return (mv < 2000) ? 0 : mv;
 }
 
 uint32_t get_sd_free_space_mb(void) {
@@ -409,3 +413,42 @@ void app_main(void) {
     esp_deep_sleep_start();
 }
     
+
+
+// Код для проверки причины выхода из сна. Если при нажатии кнопки, то включаем вайфай, если по таймеру, то не включаем. 
+//void app_main(void) {
+//    uint64_t session_start_us = esp_timer_get_time();
+//    hardware_errors_mask = 0;
+//
+//    // Считываем аппаратно причину, почему процессор включился
+//    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+//
+//    // Создаем флаг: запускать Wi-Fi или нет
+//    bool need_wifi = false;
+//
+//    if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
+//        // Проснулись планово по таймеру — Wi-Fi НЕ НУЖЕН, экономим батарею!
+//        need_wifi = false;
+//        ESP_LOGI(TAG, "Плановое пробуждение по таймеру. Снимаем и спим.");
+//    } else {
+//        // Проснулись после сброса питания (Power-On Reset) или нажатия кнопки RESET!
+//        // Включаем Wi-Fi, чтобы хозяин мог забрать фотографии со смартфона
+//        need_wifi = true;
+//        ESP_LOGW(TAG, "[!] РУЧНОЙ СТАРТ (RESET). Включаем Wi-Fi и ждем Flutter-пульт!");
+//    }
+//
+//    // ... (Далее идет съемка кадра take_photo() и запись на SD-карту) ...
+//
+//    // Модифицируем шаг №3 (Сетевой блок)
+//    // Wi-Fi инициализируется и запускается ТОЛЬКО если need_wifi == true
+//    if (need_wifi && wifi_init_sta()) {
+//        ESP_LOGI(TAG, "Wi-Fi активен в ручном режиме. Потоковая выгрузка архива...");
+//        
+//        // ... (Здесь идет весь наш сетевой диалог А и Б: send_info, send_file) ...
+//        
+//    } else if (need_wifi) {
+//        ESP_LOGE(TAG, "Не удалось подключиться к смартфону при ручном старте.");
+//    }
+//
+//    // И всё! Если need_wifi был false, плата просто пропустит весь тяжелый сетевой блок 
+//    // и мгновенно перейдет к метке sleep, потратив минимум энергии!
