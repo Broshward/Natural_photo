@@ -118,26 +118,87 @@ void format_sd_card(void) {
     }
 }
 
-camera_fb_t* take_photo(void) 
-{
-    // Если инициализация железного драйвера камеры провалилась - фиксируем ошибку 0x01
+// Вспомогательная функция прямой записи в регистр OV3660 через встроенное SCCB API библиотеки
+static int write_sensor_reg(uint16_t reg, uint8_t val) {
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s) return -1;
+    // Вызываем скрытый метод прямой записи в I2C шину датчика
+    return s->set_reg(s, reg, 0xFF, val); 
+}
+static uint8_t read_sensor_reg(uint16_t reg) {
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s) {
+        ESP_LOGE("sensor_debug", "Датчик камеры не инициализирован!");
+        return 0;
+    }
+    // Вызываем скрытый метод чтения: передаем указатель на сенсор, адрес регистра и маску битов (0xFF)
+    return s->get_reg(s, reg, 0xFF);
+}
+
+void shutdown_greenhouse_camera(void) {
+    ESP_LOGW("main_cam", "[!] Отправляем OV3660 в программный Standby (40 мкА)...");
+    
+    // Включаем бит 6 в регистре 0x3008, полностью обесточивая матрицу и объектив!
+    write_sensor_reg(0x3008, 0x40); 
+}
+
+void audit_ov3660_pll(void) {
+    ESP_LOGW("pll_debug", "=== ОПРОС РЕГИСТРОВ PLL OV3660 ===");
+    
+    uint8_t r_303a = read_sensor_reg(0x303A);
+    uint8_t r_303b = read_sensor_reg(0x303B);
+    uint8_t r_303c = read_sensor_reg(0x303C);
+    uint8_t r_303d = read_sensor_reg(0x303D);
+    uint8_t r_3008 = read_sensor_reg(0x3008);
+
+    ESP_LOGI("pll_debug", "Регистр 0x303A (PLL Bypass): 0x%02X [Bit 7: %d]", r_303a, (r_303a >> 7) & 1);
+    ESP_LOGI("pll_debug", "Регистр 0x303B (PLL Multiplier): 0x%02X [Множитель: %d]", r_303b, r_303b & 0x1F);
+    ESP_LOGI("pll_debug", "Регистр 0x303C (Sys Divider): 0x%02X [Делитель: %d]", r_303c, r_303c & 0x0F);
+    ESP_LOGI("pll_debug", "Регистр 0x303D (Pre-divider): 0x%02X", r_303d);
+    ESP_LOGI("pll_debug", "Регистр 0x3008 (Текущий режим питания): 0x%02X", r_3008);
+    
+    ESP_LOGW("pll_debug", "=================================");
+}
+
+camera_fb_t* take_photo(void) {
     if (esp_camera_init(&camera_config) != ESP_OK) {
         hardware_errors_mask |= 0x01;
         return NULL;
     }
-    vTaskDelay(pdMS_TO_TICKS(1500)); 
+    
+	ESP_LOGI(TAG, "Temperature of camera %u", read_sensor_reg(0x6719));
+	ESP_LOGI(TAG, "Compression enable %u", read_sensor_reg(0x3821));
+	ESP_LOGI(TAG, "Compression MODE %u", read_sensor_reg(0x4713));
+	ESP_LOGI(TAG, "SCCB_ID %u", read_sensor_reg(0x4713));
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Даем камере перестроиться на черепаший шаг
+    audit_ov3660_pll();
+
+    ESP_LOGW("main_cam", "[!] Включаем PLL Bypass по фэншую. Замедление PCLK...");
+
+    // 2. ОТКЛЮЧАЕМ PLL МАТРИЦЫ (ВКЛЮЧАЕМ BYPASS) ИЗ ВАШЕЙ ТАБЛИЦЫ!
+    // Запись бита 7 в 1 полностью отключает умножитель. 
+    // Частота пикселей PCLK станет равна нашим чистым, медленным 10 МГц!
+    write_sensor_reg(0x303A, 0x80); 
+    
+    vTaskDelay(pdMS_TO_TICKS(200)); // Даем стабилизироваться кадрам
+
+    // Прогреваем матрицу
     for (int i = 0; i < 2; i++) {
         camera_fb_t *fb_flush = esp_camera_fb_get();
         if (fb_flush) esp_camera_fb_return(fb_flush);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+    
+    // Хватаем наш идеальный, небитый UXGA JPEG!
     camera_fb_t *fb_real = esp_camera_fb_get();
     
-    // Если кадр пустой или NULL - фиксируем ошибку 0x02
-    if (!fb_real || fb_real->len == 0) {
+    if (fb_real) {
+        ESP_LOGW("main_cam", "[SUCCESS] Кадр UXGA JPEG успешно захвачен! Вес файла: %d байт.", fb_real->len);
+    } else {
         hardware_errors_mask |= 0x02;
     }
-    return fb_real;
+    
+    return fb_real;    
 }
 
 bool save_photo_to_sd(camera_fb_t *fb, int index) {
@@ -284,8 +345,6 @@ int get_last_file_index_from_sd(void) {
 void app_main(void) {
     uint64_t session_start_us = esp_timer_get_time();
     hardware_errors_mask = 0; 
-    uint8_t *backup_frame_buffer = NULL;
-    size_t backup_frame_length = 0;
 
     gpio_config_t io_conf = { .pin_bit_mask = (1ULL << 48), .mode = GPIO_MODE_OUTPUT, .pull_up_en = 0, .pull_down_en = 1 };
     gpio_config(&io_conf); gpio_set_level(48, 0);
@@ -295,27 +354,10 @@ void app_main(void) {
     // 1. Снимаем плановый кадр во временный буфер DMA камеры
     camera_fb_t *fb = take_photo();
     
-    if (fb && fb->len > 0) {
-        // === ПУНКТ №1 ЭТАЛОННОЕ РЕШЕНИЕ: КЛОНИРУЕМ БУФЕР В СВОБОДНУЮ PSRAM ===
-        // heap_caps_malloc с флагом MALLOC_CAP_SPIRAM гарантированно выделит память во внешних 8 МБ чипа
-        backup_frame_buffer = heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM);
-        if (backup_frame_buffer != NULL) {
-            backup_frame_length = fb->len;
-            // Копируем сырые байты YUV422 из памяти камеры в нашу независимую копию
-            memcpy(backup_frame_buffer, fb->buf, fb->len);
-            ESP_LOGI(TAG, "[+] Успешный клон кадра в PSRAM: %d байт.", backup_frame_length);
-        } else {
-            hardware_errors_mask |= 0x02; // Сбой памяти под клон
-            ESP_LOGE(TAG, "Не удалось выделить PSRAM под копию кадра!");
-        }
-        
-        // Камеру возвращаем системе МГНОВЕННО
-        esp_camera_fb_return(fb); 
-    }
-    
     // ПРИНУДИТЕЛЬНО ТУШИМ КАМЕРУ! Она проработала всего 2 секунды. 
     // Линия 3.3 В разгружена, никакого нагрева и риска сжечь новую SD-карту в процессе Wi-Fi сессии!
-    esp_camera_deinit(); 
+	shutdown_greenhouse_camera();
+
     ESP_LOGI(TAG, "[+] Камера полностью обесточена. Переходим к сетевым задачам.");
 
     // 2. Инициализируем SD-карту один раз
@@ -324,9 +366,8 @@ void app_main(void) {
         boot_count = get_last_file_index_from_sd() + 1;
         
         // Пишем на карту, только если кадр не пустой (маска ошибок не содержит 0x02)
-        if (!(hardware_errors_mask & 0x02) && backup_frame_buffer && backup_frame_length > 0) {
-            camera_fb_t dummy_fb = { .buf = backup_frame_buffer, .len = backup_frame_length };
-            if (!save_photo_to_sd(&dummy_fb, boot_count)) {
+        if (!(hardware_errors_mask & 0x02) && fb->buf && fb->len > 0) {
+            if (!save_photo_to_sd(fb, boot_count)) {
                 hardware_errors_mask |= 0x04;
             }
         }
@@ -379,16 +420,17 @@ void app_main(void) {
                     last_sent_index = i;
                     heap_caps_free(file_buf);
                     vTaskDelay(pdMS_TO_TICKS(15));
-                } else if (i == boot_count && backup_frame_buffer && backup_frame_length > 0) {
-                    if (send_file(backup_frame_buffer, backup_frame_length, i)) { last_sent_index = i; }
+                } else if (i == boot_count && fb->buf && fb->len > 0) {
+                    if (send_file(fb->buf, fb->len, i)) { last_sent_index = i; }
                 }
             }
         }
     }
 
-    // Освобождаем буфер клона в самом конце
-    if (backup_frame_buffer != NULL) { heap_caps_free(backup_frame_buffer); }
-
+	//Буфер камеры больше не нужен
+	esp_camera_fb_return(fb); 
+    esp_camera_deinit(); 
+	
     // --- ФИНАЛЬНЫЙ СИНХРОННЫЙ УХОД В СОН (БЕЗ МЕТОК) ---
     esp_wifi_stop();
 

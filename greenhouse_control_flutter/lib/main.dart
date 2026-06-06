@@ -80,7 +80,7 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
         image.setPixelRgb(c + 1, r, r1.clamp(0, 255), g1.clamp(0, 255), b1.clamp(0, 255));
       }
     }
-    return Uint8List.fromList(img_lib.encodeJpg(image, quality: 90));
+    return Uint8List.fromList(img_lib.encodeJpg(image, quality: 100));
   }
 
   // РЕШЕНИЕ ПРОБЛЕМЫ СИНХРОНИЗАЦИИ: Сканируем папку по динамическому пути песочницы!
@@ -118,8 +118,8 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
   }
 
   // ЛИНЕЙНЫЙ ДИСПЕТЧЕР С ПОШАГОВЫМ ОЖИДАНИЕМ БУФЕРА
-    void _handleEsp32Connection(Socket client) async {
-    client.timeout(const Duration(seconds: 35)); 
+  void _handleEsp32Connection(Socket client) async {
+    client.timeout(const Duration(seconds: 15)); 
     final iterator = StreamIterator<Uint8List>(client);
     List<int> currentBuffer = [];
 
@@ -130,9 +130,7 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
       }
 
       if (currentBuffer.length < 16) {
-        await client.close();
-        iterator.cancel();
-        return;
+        await client.close(); iterator.cancel(); return;
       }
 
       final bd = ByteData.sublistView(Uint8List.fromList(currentBuffer.sublist(0, 16)));
@@ -145,7 +143,7 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
       int batPct = (((batV - 3.5) / (4.2 - 3.5)) * 100).clamp(0, 100).toInt();
       double freeGb = freeSpaceMb / 1024.0;
 
-      // СЦЕНАРИЙ А: Холостой пинг синхронизации
+      // СЦЕНАРИЙ А: Холостой пинг
       if (imgSize == 0) {
         int errorMask = imgIndex; 
         String hardwareLog = "[OK] Железо платы исправно";
@@ -165,60 +163,38 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
         });
 
         if (_otaMode) {
-          // === КРИСТАЛЬНО СИНХРОННЫЙ ОТА ПОТОК ИЗ ЛЕГАЛЬНОЙ ПАПКИ ===
-          final extDir = await getExternalStorageDirectory();
-          if (extDir != null) {
-            final otaFile = File('${extDir.path}/greenhouse_archive/firmware.bin');
+          final otaFile = File('/storage/emulated/0/Download/firmware.bin');
+          if (otaFile.existsSync()) {
+            int otaSize = otaFile.lengthSync();
+            client.add(Uint8List.fromList("OTA:$otaSize".codeUnits));
+            await client.flush(); 
             
-            if (otaFile.existsSync()) {
-              int otaSize = otaFile.lengthSync();
-              
-              client.add(Uint8List.fromList("OTA:$otaSize".codeUnits));
-              await client.flush(); 
-              print("[*] Команда OTA:$otaSize успешно отправлена.");
-
-              currentBuffer = currentBuffer.sublist(16);
-              while (!currentBuffer.contains(82) || !currentBuffer.contains(89)) { 
-                if (!await iterator.moveNext()) break;
-                currentBuffer.addAll(iterator.current);
-              }
-
-              print("[+] Си-сигнал READY подтвержден. Заливка бинарника...");
-              setState(() { _statusText = "Передача прошивки по воздуху..."; });
-              
-              final binaryBytes = otaFile.readAsBytesSync(); // Читаем синхронно без Permission Denied!
-              client.add(binaryBytes);
-              await client.flush(); 
-              
-              print("[+] Прошивка полностью улетела в плату!");
-              setState(() { _otaMode = false; _statusText = "Прошивка успешно загружена! Плата ребутается."; });
-            } else {
-              client.write("OTA_ERR"); await client.flush(); _otaMode = false;
-              setState(() { _statusText = "Файл firmware.bin не найден в greenhouse_archive!"; });
+            currentBuffer = currentBuffer.sublist(16);
+            while (!currentBuffer.contains(82) || !currentBuffer.contains(89)) { 
+              if (!await iterator.moveNext()) break;
+              currentBuffer.addAll(iterator.current);
             }
+            setState(() { _statusText = "Передача прошивки по воздуху..."; });
+            final binaryBytes = otaFile.readAsBytesSync();
+            client.add(binaryBytes);
+            await client.flush(); 
+            setState(() { _otaMode = false; _statusText = "Прошивка успешно загружена!"; });
           }
-          await client.close();
-          iterator.cancel();
-          return;
+          await client.close(); iterator.cancel(); return;
         } else if (_formatRequested) {
           client.add(Uint8List.fromList("FORMAT_SD\n".codeUnits)); await client.flush();
           _formatRequested = false;
-          setState(() { _statusText = "Сигнал форматирования передан на плату!"; });
-          await client.close();
-          iterator.cancel();
-          return;
+          setState(() { _statusText = "Сигнал форматирования передан!"; });
+          await client.close(); iterator.cancel(); return;
         } else {
           int maxSavedIdx = await get_max_saved_index();
           final resp = ByteData(4)..setInt32(0, maxSavedIdx, Endian.little);
           client.add(resp.buffer.asUint8List());
-          await client.flush();
-          await client.close();
-          iterator.cancel();
-          return;
+          await client.flush(); await client.close(); iterator.cancel(); return;
         }
       }
 
-      // СЦЕНАРИЙ Б: Прием бинарного тела кадра YUV422
+      // СЦЕНАРИЙ Б: Восстановленный прием и декодирование YUV422 от OV3660
       if (imgSize > 0) {
         List<int> imagePayload = currentBuffer.sublist(16);
         while (imagePayload.length < imgSize) {
@@ -226,9 +202,9 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
           imagePayload.addAll(iterator.current);
         }
 
-        print("[*] Буфер кадра собран. Принято: ${imagePayload.length} байт.");
-
         final rawYuvBytes = Uint8List.fromList(imagePayload.sublist(0, imgSize));
+        
+        // ВЫЗЫВАЕМ НАШ ИСПРАВЛЕННЫЙ КОНВЕРТЕР ЦВЕТОВ ОV3660
         final convertedJpeg = convertYuv422ToJpeg(rawYuvBytes, 1024, 768);
 
         try {
@@ -241,7 +217,7 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
             final file = File('${greenhouseFolder.path}/$fileStringIndex.jpg');
             await file.writeAsBytes(convertedJpeg); 
           }
-        } catch (e) { print("Ошибка записи кадра: $e"); }
+        } catch (e) { print("Ошибка записи: $e"); }
 
         setState(() {
           _jpegBytes = convertedJpeg;
@@ -250,9 +226,7 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
 
         final ack = ByteData(4)..setInt32(0, imgIndex, Endian.little);
         client.add(ack.buffer.asUint8List());
-        await client.flush();
-        await client.close();
-        iterator.cancel();
+        await client.flush(); await client.close(); iterator.cancel();
       }
 
     } catch (e) {
