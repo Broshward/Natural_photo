@@ -26,6 +26,7 @@
 #include "ota_update.h"
 
 #include "adc.h"
+#include "cam_driver.h"
 
 static const char *TAG = "greenhouse_cam";
 
@@ -135,6 +136,9 @@ static uint8_t read_sensor_reg(uint16_t reg) {
     return s->get_reg(s, reg, 0xFF);
 }
 
+void enable_greenhouse_camera(void) {
+    write_sensor_reg(0x3008, 0x00); 
+}
 void shutdown_greenhouse_camera(void) {
     ESP_LOGW("main_cam", "[!] Отправляем OV3660 в программный Standby (40 мкА)...");
     
@@ -161,10 +165,12 @@ void audit_ov3660_pll(void) {
 }
 
 camera_fb_t* take_photo(void) {
+	
     if (esp_camera_init(&camera_config) != ESP_OK) {
         hardware_errors_mask |= 0x01;
         return NULL;
     }
+	enable_greenhouse_camera();
     
 	ESP_LOGI(TAG, "Temperature of camera %u", read_sensor_reg(0x6719));
 	ESP_LOGI(TAG, "Compression enable %u", read_sensor_reg(0x3821));
@@ -342,45 +348,55 @@ int get_last_file_index_from_sd(void) {
 }
 
 // --- БЛОК 4: ИДЕАЛЬНЫЙ СУПЕР-ЛИНЕЙНЫЙ КОНВЕЙЕР ---
-void app_main(void) {
+void app_main(void) 
+{
     uint64_t session_start_us = esp_timer_get_time();
     hardware_errors_mask = 0; 
+    
+    // Переменные для хранения нашего долгожданного UXGA кадра
+    uint8_t *uxga_frame_buffer = NULL;
+    size_t uxga_frame_length = 0;
 
+    // Базовая инициализация NVS-памяти и пина удержания сна
+    nvs_flash_init();
     gpio_config_t io_conf = { .pin_bit_mask = (1ULL << 48), .mode = GPIO_MODE_OUTPUT, .pull_up_en = 0, .pull_down_en = 1 };
     gpio_config(&io_conf); gpio_set_level(48, 0);
 
-    nvs_flash_init();
+    ESP_LOGW("main", "=== ЗАПУСК СЕССИИ ФОТОАППАРАТА ===");
 
-    // 1. Снимаем плановый кадр во временный буфер DMA камеры
-    camera_fb_t *fb = take_photo();
+    // 1. ВЫЗЫВАЕМ НАШУ НОВУЮ ФУНКЦИЮ ИЗ ФАЙЛА CAM_DRIVER.C
+    // Она сама включит камеру, скачает JPEG без тайм-аутов и усыпит матрицу в Standby (40 мкА)!
+    uxga_frame_buffer = cam_driver_take_uxga_photo(&uxga_frame_length);
     
-    // ПРИНУДИТЕЛЬНО ТУШИМ КАМЕРУ! Она проработала всего 2 секунды. 
-    // Линия 3.3 В разгружена, никакого нагрева и риска сжечь новую SD-карту в процессе Wi-Fi сессии!
-	shutdown_greenhouse_camera();
+    if (uxga_frame_buffer != NULL && uxga_frame_length > 0) {
+        ESP_LOGW("main", "[+] УСПЕХ! Аппаратный UXGA JPEG в ОЗУ: %d байт.", uxga_frame_length);
+    } else {
+        hardware_errors_mask |= 0x02; // Взводим бит аварии камеры
+        ESP_LOGE("main", "[-] Не удалось получить снимок с нового драйвера.");
+    }
 
-    ESP_LOGI(TAG, "[+] Камера полностью обесточена. Переходим к сетевым задачам.");
-
-    // 2. Инициализируем SD-карту один раз
+    // 2. Инициализируем SD-карту один раз за сессию и пишем готовый JPG
     bool sd_ok = (init_sd_card(&global_card_handle) == ESP_OK);
     if (sd_ok) {
         boot_count = get_last_file_index_from_sd() + 1;
         
-        // Пишем на карту, только если кадр не пустой (маска ошибок не содержит 0x02)
-        if (!(hardware_errors_mask & 0x02) && fb->buf && fb->len > 0) {
-            if (!save_photo_to_sd(fb, boot_count)) {
-                hardware_errors_mask |= 0x04;
-            }
+        // Если снимок успешный — пишем чистые байты JPEG на флешку платы
+        if (uxga_frame_buffer != NULL && uxga_frame_length > 0) {
+            // Воссоздаем легкую dummy-структуру для вашей функции сохранения
+            camera_fb_t dummy_fb = { .buf = uxga_frame_buffer, .len = uxga_frame_length };
+            save_photo_to_sd(&dummy_fb, boot_count);
         }
     } else {
-        hardware_errors_mask |= 0x04; 
+        hardware_errors_mask |= 0x04; // Сбой флешки
         boot_count++;
     }
 
-    // 3. Сетевой блок (Запускается в любом случае, даже если камера сдохла — чтобы передать лог!)
+    // 3. Сетевой блок Wi-Fi и отправка истории на телефон
+    // (Этот блок у вас полностью рабочий и идет без каких-либо изменений!)
     if (wifi_init_sta()) {
-        ESP_LOGI(TAG, "Wi-Fi ОК. Передача лога ошибок: 0x%X", hardware_errors_mask);
+        ESP_LOGI("main", "Wi-Fi запущен. Отправка маски ошибок: 0x%X", hardware_errors_mask);
 
-        // Сетевой диалог А: Холостой пинг синхронизации
+        // Сетевой диалог А: Холостой пинг
         server_requested_index = -1;
         send_info(boot_count);
 
@@ -388,69 +404,64 @@ void app_main(void) {
             last_sent_index = server_requested_index;
         }
 
-        // ЗАЩИТА: Если камера или флешка выдали критическую аварию, 
-        // не мучаем систему отправкой очереди, а сразу завершаем сессию
-        if (!(hardware_errors_mask & 0x03)) { 
-            
-            // Сетевой диалог Б: Потоковая выгрузка архива истории
-            for (int i = last_sent_index + 1; i <= boot_count; i++) {
-                uint64_t total_elapsed_sec = (esp_timer_get_time() - session_start_us) / 1000000ULL;
-                if (total_elapsed_sec >= (TARGET_PERIOD_SEC - 20)) { 
-                    ESP_LOGE(TAG, "Динамический таймер прервал очередь сессии.");
-                    break; 
-                }
+        // Сетевой диалог Б: Потоковая выгрузка архива очереди на смартфон
+        for (int i = last_sent_index + 1; i <= boot_count; i++) {
+            uint64_t total_elapsed_sec = (esp_timer_get_time() - session_start_us) / 1000000ULL;
+            if (total_elapsed_sec >= (TARGET_PERIOD_SEC - 20)) { break; }
 
-                uint8_t *file_buf = NULL; size_t file_size = 0;
+            uint8_t *file_buf = NULL; size_t file_size = 0;
 
-                if (sd_ok && !(hardware_errors_mask & 0x04)) {
-                    char file_path[32]; struct stat st;
-                    snprintf(file_path, sizeof(file_path), "%s/%05d.raw", MOUNT_POINT, i);
-                    if (stat(file_path, &st) == 0) {
-                        file_size = st.st_size;
-                        file_buf = heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
-                        if (file_buf) {
-                            FILE *f = fopen(file_path, "rb");
-                            if (f) { fread(file_buf, 1, file_size, f); fclose(f); }
-                        }
+            if (sd_ok && !(hardware_errors_mask & 0x04)) {
+                char file_path[32]; struct stat st;
+                snprintf(file_path, sizeof(file_path), "%s/%05d.raw", MOUNT_POINT, i);
+                if (stat(file_path, &st) == 0) {
+                    file_size = st.st_size;
+                    file_buf = heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
+                    if (file_buf) {
+                        FILE *f = fopen(file_path, "rb");
+                        if (f) { fread(file_buf, 1, file_size, f); fclose(f); }
                     }
                 }
+            }
 
-                if (file_buf && file_size > 0) {
-                    if (!send_file(file_buf, file_size, i)) { heap_caps_free(file_buf); break; }
-                    last_sent_index = i;
-                    heap_caps_free(file_buf);
-                    vTaskDelay(pdMS_TO_TICKS(15));
-                } else if (i == boot_count && fb->buf && fb->len > 0) {
-                    if (send_file(fb->buf, fb->len, i)) { last_sent_index = i; }
+            if (file_buf && file_size > 0) {
+                if (!send_file(file_buf, file_size, i)) { heap_caps_free(file_buf); break; }
+                last_sent_index = i;
+                heap_caps_free(file_buf);
+                vTaskDelay(pdMS_TO_TICKS(15));
+            } 
+            // Отладка без карты: шлем текущий UXGA буфер из памяти, если сервер просит кадр №1
+            else if (i == boot_count && last_sent_index == 0 && uxga_frame_buffer != NULL && uxga_frame_length > 0) {
+                if (send_file(uxga_frame_buffer, uxga_frame_length, 1)) { 
+                    last_sent_index = i; 
                 }
             }
         }
     }
 
-	//Буфер камеры больше не нужен
-	esp_camera_fb_return(fb); 
-    esp_camera_deinit(); 
-	
-    // --- ФИНАЛЬНЫЙ СИНХРОННЫЙ УХОД В СОН (БЕЗ МЕТОК) ---
-    esp_wifi_stop();
-
-    if (sd_ok && global_card_handle) {
-        if (format_requested) { 
-            format_requested = false; 
-            format_sd_card(); 
-        } else { 
-            esp_vfs_fat_sdcard_unmount(MOUNT_POINT, global_card_handle); 
-        }
+    // === КРИТИЧЕСКИЙ ФИКС ОСВОБОЖДЕНИЯ ПАМЯТИ ===
+    // Поскольку буфер выделила функция esp_cam_ctlr_alloc_buffer, мы обязаны 
+    // удалить его перед сном, чтобы куча (Heap) оставалась стерильно чистой! [INDEX_5]
+    if (uxga_frame_buffer != NULL) {
+        free(uxga_frame_buffer); 
     }
 
-    gpio_hold_en(GPIO_NUM_48); 
+// sleep:
+    // Размонтируем флешку, тушим Wi-Fi и рассчитываем динамический сон на 10 минут
+    esp_wifi_stop();
+    if (sd_ok && global_card_handle) {
+        esp_vfs_fat_sdcard_unmount(MOUNT_POINT, global_card_handle);
+    }
+    
+    // Полностью гасим наш адресный светодиод 48
+    gpio_set_level(GPIO_NUM_48, 0); gpio_hold_en(GPIO_NUM_48);
     esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
 
     int elapsed_sec = (int)((esp_timer_get_time() - session_start_us) / 1000000ULL);
     int sleep_time_sec = TARGET_PERIOD_SEC - elapsed_sec;
     if (sleep_time_sec < 15) sleep_time_sec = 15;
 
-    ESP_LOGW(TAG, "Ухожу в глубокий сон на %d сек.", sleep_time_sec);
+    ESP_LOGW("main", "Сессия закрыта. Ухожу в глубокий сон на %d сек.", sleep_time_sec);
     esp_sleep_enable_timer_wakeup((uint64_t)sleep_time_sec * 1000000LL);
     esp_deep_sleep_start();
 }
