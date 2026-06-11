@@ -205,8 +205,8 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
         final rawYuvBytes = Uint8List.fromList(imagePayload.sublist(0, imgSize));
         
         // ВЫЗЫВАЕМ НАШ ИСПРАВЛЕННЫЙ КОНВЕРТЕР ЦВЕТОВ ОV3660
-        final convertedJpeg = convertYuv422ToJpeg(rawYuvBytes, 640, 480);
-        //final convertedJpeg = convertYuv422ToJpeg(rawYuvBytes, 1600, 1200);
+//        final convertedJpeg = convertYuv422ToJpeg(rawYuvBytes, 2048, 1536);
+        final convertedJpeg = convertYuv422ToJpeg(rawYuvBytes, 1600, 1200);
 
         try {
           final extDir = await getExternalStorageDirectory();
