@@ -17,6 +17,7 @@
 #include "driver/sdmmc_host.h"
 #include "driver/gpio.h"
 #include "ff.h"
+#include "driver/i2c_master.h"
 
 // Сеть и OTA
 #include "esp_wifi.h"
@@ -26,7 +27,7 @@
 #include "ota_update.h"
 
 #include "adc.h"
-#include "cam_driver.h"
+#include "manual_cam.h"
 
 static const char *TAG = "greenhouse_cam";
 
@@ -54,6 +55,10 @@ static const char *TAG = "greenhouse_cam";
 #define HREF_GPIO_NUM     7
 #define PCLK_GPIO_NUM     13
 
+#define DVP_CAM_SCCB_SCL_IO           5
+#define DVP_CAM_SCCB_SDA_IO           4
+#define OV3660_I2C_ADDR               0x3C
+
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
@@ -66,35 +71,6 @@ static sdmmc_card_t* global_card_handle = NULL;
 
 // Битовая маска системного лога ошибок (0 — все идеально)
 static uint32_t hardware_errors_mask = 0; 
-
-
-static camera_config_t camera_config = {
-    .pin_pwdn = -1, 
-	.pin_reset = -1,
-	.pin_xclk = XCLK_GPIO_NUM,
-    .pin_sccb_sda = SIOD_GPIO_NUM,
-	.pin_sccb_scl = SIOC_GPIO_NUM,
-    .pin_d7 = Y9_GPIO_NUM,
-	.pin_d6 = Y8_GPIO_NUM,
-	.pin_d5 = Y7_GPIO_NUM,
-	.pin_d4 = Y6_GPIO_NUM,
-    .pin_d3 = Y5_GPIO_NUM,
-	.pin_d2 = Y4_GPIO_NUM,
-	.pin_d1 = Y3_GPIO_NUM,
-	.pin_d0 = Y2_GPIO_NUM,
-    .pin_vsync = VSYNC_GPIO_NUM, 
-	.pin_href = HREF_GPIO_NUM,
-	.pin_pclk = PCLK_GPIO_NUM,
-    .xclk_freq_hz = 24000000,
-	.ledc_timer = LEDC_TIMER_0,
-	.ledc_channel = LEDC_CHANNEL_0,
-    .pixel_format = PIXFORMAT_YUV422,
-	.frame_size = FRAMESIZE_XGA,
-    .jpeg_quality = 12,
-	.fb_count = 1,
-	.grab_mode = CAMERA_GRAB_WHEN_EMPTY,
-	.fb_location = CAMERA_FB_IN_PSRAM    
-};
 
 static esp_err_t init_sd_card(sdmmc_card_t** out_card) {
     esp_vfs_fat_sdmmc_mount_config_t mount_config = { .format_if_mount_failed = false, .max_files = 2, .allocation_unit_size = 16 * 1024 };
@@ -117,94 +93,6 @@ void format_sd_card(void) {
     if (f_mkfs("0:", &format_opt, NULL, 1024) == FR_OK) {
         boot_count = 0; last_sent_index = 0;
     }
-}
-
-// Вспомогательная функция прямой записи в регистр OV3660 через встроенное SCCB API библиотеки
-static int write_sensor_reg(uint16_t reg, uint8_t val) {
-    sensor_t *s = esp_camera_sensor_get();
-    if (!s) return -1;
-    // Вызываем скрытый метод прямой записи в I2C шину датчика
-    return s->set_reg(s, reg, 0xFF, val); 
-}
-static uint8_t read_sensor_reg(uint16_t reg) {
-    sensor_t *s = esp_camera_sensor_get();
-    if (!s) {
-        ESP_LOGE("sensor_debug", "Датчик камеры не инициализирован!");
-        return 0;
-    }
-    // Вызываем скрытый метод чтения: передаем указатель на сенсор, адрес регистра и маску битов (0xFF)
-    return s->get_reg(s, reg, 0xFF);
-}
-
-void enable_greenhouse_camera(void) {
-    write_sensor_reg(0x3008, 0x00); 
-}
-void shutdown_greenhouse_camera(void) {
-    ESP_LOGW("main_cam", "[!] Отправляем OV3660 в программный Standby (40 мкА)...");
-    
-    // Включаем бит 6 в регистре 0x3008, полностью обесточивая матрицу и объектив!
-    write_sensor_reg(0x3008, 0x40); 
-}
-
-void audit_ov3660_pll(void) {
-    ESP_LOGW("pll_debug", "=== ОПРОС РЕГИСТРОВ PLL OV3660 ===");
-    
-    uint8_t r_303a = read_sensor_reg(0x303A);
-    uint8_t r_303b = read_sensor_reg(0x303B);
-    uint8_t r_303c = read_sensor_reg(0x303C);
-    uint8_t r_303d = read_sensor_reg(0x303D);
-    uint8_t r_3008 = read_sensor_reg(0x3008);
-
-    ESP_LOGI("pll_debug", "Регистр 0x303A (PLL Bypass): 0x%02X [Bit 7: %d]", r_303a, (r_303a >> 7) & 1);
-    ESP_LOGI("pll_debug", "Регистр 0x303B (PLL Multiplier): 0x%02X [Множитель: %d]", r_303b, r_303b & 0x1F);
-    ESP_LOGI("pll_debug", "Регистр 0x303C (Sys Divider): 0x%02X [Делитель: %d]", r_303c, r_303c & 0x0F);
-    ESP_LOGI("pll_debug", "Регистр 0x303D (Pre-divider): 0x%02X", r_303d);
-    ESP_LOGI("pll_debug", "Регистр 0x3008 (Текущий режим питания): 0x%02X", r_3008);
-    
-    ESP_LOGW("pll_debug", "=================================");
-}
-
-camera_fb_t* take_photo(void) {
-	
-    if (esp_camera_init(&camera_config) != ESP_OK) {
-        hardware_errors_mask |= 0x01;
-        return NULL;
-    }
-	enable_greenhouse_camera();
-    
-	ESP_LOGI(TAG, "Temperature of camera %u", read_sensor_reg(0x6719));
-	ESP_LOGI(TAG, "Compression enable %u", read_sensor_reg(0x3821));
-	ESP_LOGI(TAG, "Compression MODE %u", read_sensor_reg(0x4713));
-	ESP_LOGI(TAG, "SCCB_ID %u", read_sensor_reg(0x4713));
-    vTaskDelay(pdMS_TO_TICKS(1000)); // Даем камере перестроиться на черепаший шаг
-    audit_ov3660_pll();
-
-    ESP_LOGW("main_cam", "[!] Включаем PLL Bypass по фэншую. Замедление PCLK...");
-
-    // 2. ОТКЛЮЧАЕМ PLL МАТРИЦЫ (ВКЛЮЧАЕМ BYPASS) ИЗ ВАШЕЙ ТАБЛИЦЫ!
-    // Запись бита 7 в 1 полностью отключает умножитель. 
-    // Частота пикселей PCLK станет равна нашим чистым, медленным 10 МГц!
-    write_sensor_reg(0x303A, 0x80); 
-    
-    vTaskDelay(pdMS_TO_TICKS(200)); // Даем стабилизироваться кадрам
-
-    // Прогреваем матрицу
-    for (int i = 0; i < 2; i++) {
-        camera_fb_t *fb_flush = esp_camera_fb_get();
-        if (fb_flush) esp_camera_fb_return(fb_flush);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    
-    // Хватаем наш идеальный, небитый UXGA JPEG!
-    camera_fb_t *fb_real = esp_camera_fb_get();
-    
-    if (fb_real) {
-        ESP_LOGW("main_cam", "[SUCCESS] Кадр UXGA JPEG успешно захвачен! Вес файла: %d байт.", fb_real->len);
-    } else {
-        hardware_errors_mask |= 0x02;
-    }
-    
-    return fb_real;    
 }
 
 bool save_photo_to_sd(camera_fb_t *fb, int index) {
@@ -353,37 +241,49 @@ void app_main(void)
     uint64_t session_start_us = esp_timer_get_time();
     hardware_errors_mask = 0; 
     
-    // Переменные для хранения нашего долгожданного UXGA кадра
-    uint8_t *uxga_frame_buffer = NULL;
-    size_t uxga_frame_length = 0;
-
     // Базовая инициализация NVS-памяти и пина удержания сна
     nvs_flash_init();
     gpio_config_t io_conf = { .pin_bit_mask = (1ULL << 48), .mode = GPIO_MODE_OUTPUT, .pull_up_en = 0, .pull_down_en = 1 };
     gpio_config(&io_conf); gpio_set_level(48, 0);
 
+//    gpio_reset_pin(CAM_XCLK_IO); // Очищаем любые конфликты с LEDC ШИМ!
+//    gpio_set_direction(CAM_XCLK_IO, GPIO_MODE_OUTPUT);
+//	
+//    ledc_timer_config_t ledc_timer = {
+//        .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = LEDC_TIMER_1,
+//        .duty_resolution = LEDC_TIMER_1_BIT, .freq_hz = 12000000, .clk_cfg = LEDC_AUTO_CLK
+//    };
+//    ledc_timer_config(&ledc_timer);
+//    ledc_channel_config_t ledc_channel = {
+//        .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_1, .timer_sel = LEDC_TIMER_1,
+//        .intr_type = LEDC_INTR_DISABLE, .gpio_num = CAM_XCLK_IO, .duty = 1, .hpoint = 0
+//    };
+//    ledc_channel_config(&ledc_channel);
+    
     ESP_LOGW("main", "=== ЗАПУСК СЕССИИ ФОТОАППАРАТА ===");
 
-    // 1. ВЫЗЫВАЕМ НАШУ НОВУЮ ФУНКЦИЮ ИЗ ФАЙЛА CAM_DRIVER.C
-    // Она сама включит камеру, скачает JPEG без тайм-аутов и усыпит матрицу в Standby (40 мкА)!
-    uxga_frame_buffer = cam_driver_take_uxga_photo(&uxga_frame_length);
+    // Выделяем буфер под честный UXGA YUV422 в наших 8 МБ PSRAM
+    size_t frame_buffer_length = 1600 * 1200 * 2; // Ровно 3 840 000 байт
+    uint8_t *frame_buffer = heap_caps_malloc(frame_buffer_length, MALLOC_CAP_SPIRAM);	
+
+	esp_err_t ret = take_photo(frame_buffer, frame_buffer_length);
+while(1) vTaskDelay(1);
     
-    if (uxga_frame_buffer != NULL && uxga_frame_length > 0) {
-        ESP_LOGW("main", "[+] УСПЕХ! Аппаратный UXGA JPEG в ОЗУ: %d байт.", uxga_frame_length);
+    if (frame_buffer != NULL && frame_buffer_length > 0) {
+        ESP_LOGW("main", "[+] УСПЕХ! Аппаратный UXGA JPEG в ОЗУ: %d байт.", frame_buffer_length);
     } else {
         hardware_errors_mask |= 0x02; // Взводим бит аварии камеры
         ESP_LOGE("main", "[-] Не удалось получить снимок с нового драйвера.");
     }
-
     // 2. Инициализируем SD-карту один раз за сессию и пишем готовый JPG
     bool sd_ok = (init_sd_card(&global_card_handle) == ESP_OK);
     if (sd_ok) {
         boot_count = get_last_file_index_from_sd() + 1;
         
         // Если снимок успешный — пишем чистые байты JPEG на флешку платы
-        if (uxga_frame_buffer != NULL && uxga_frame_length > 0) {
+        if (frame_buffer != NULL && frame_buffer_length > 0) {
             // Воссоздаем легкую dummy-структуру для вашей функции сохранения
-            camera_fb_t dummy_fb = { .buf = uxga_frame_buffer, .len = uxga_frame_length };
+            camera_fb_t dummy_fb = { .buf = frame_buffer, .len = frame_buffer_length };
             save_photo_to_sd(&dummy_fb, boot_count);
         }
     } else {
@@ -431,8 +331,8 @@ void app_main(void)
                 vTaskDelay(pdMS_TO_TICKS(15));
             } 
             // Отладка без карты: шлем текущий UXGA буфер из памяти, если сервер просит кадр №1
-            else if (i == boot_count && last_sent_index == 0 && uxga_frame_buffer != NULL && uxga_frame_length > 0) {
-                if (send_file(uxga_frame_buffer, uxga_frame_length, 1)) { 
+            else if (i == boot_count && last_sent_index == 0 && frame_buffer != NULL && frame_buffer_length > 0) {
+                if (send_file(frame_buffer, frame_buffer_length, 1)) { 
                     last_sent_index = i; 
                 }
             }
@@ -442,8 +342,8 @@ void app_main(void)
     // === КРИТИЧЕСКИЙ ФИКС ОСВОБОЖДЕНИЯ ПАМЯТИ ===
     // Поскольку буфер выделила функция esp_cam_ctlr_alloc_buffer, мы обязаны 
     // удалить его перед сном, чтобы куча (Heap) оставалась стерильно чистой! [INDEX_5]
-    if (uxga_frame_buffer != NULL) {
-        free(uxga_frame_buffer); 
+    if (frame_buffer != NULL) {
+        heap_caps_free(frame_buffer); 
     }
 
 // sleep:
