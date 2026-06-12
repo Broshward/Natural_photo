@@ -246,28 +246,16 @@ void app_main(void)
     gpio_config_t io_conf = { .pin_bit_mask = (1ULL << 48), .mode = GPIO_MODE_OUTPUT, .pull_up_en = 0, .pull_down_en = 1 };
     gpio_config(&io_conf); gpio_set_level(48, 0);
 
-//    gpio_reset_pin(CAM_XCLK_IO); // Очищаем любые конфликты с LEDC ШИМ!
-//    gpio_set_direction(CAM_XCLK_IO, GPIO_MODE_OUTPUT);
-//	
-//    ledc_timer_config_t ledc_timer = {
-//        .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = LEDC_TIMER_1,
-//        .duty_resolution = LEDC_TIMER_1_BIT, .freq_hz = 12000000, .clk_cfg = LEDC_AUTO_CLK
-//    };
-//    ledc_timer_config(&ledc_timer);
-//    ledc_channel_config_t ledc_channel = {
-//        .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_1, .timer_sel = LEDC_TIMER_1,
-//        .intr_type = LEDC_INTR_DISABLE, .gpio_num = CAM_XCLK_IO, .duty = 1, .hpoint = 0
-//    };
-//    ledc_channel_config(&ledc_channel);
-    
+
     ESP_LOGW("main", "=== ЗАПУСК СЕССИИ ФОТОАППАРАТА ===");
 
     // Выделяем буфер под честный UXGA YUV422 в наших 8 МБ PSRAM
-    size_t frame_buffer_length = 1600 * 1200 * 2; // Ровно 3 840 000 байт
+    size_t frame_buffer_length = 640 * 480 * 2; // Ровно 3 840 000 байт
     uint8_t *frame_buffer = heap_caps_malloc(frame_buffer_length, MALLOC_CAP_SPIRAM);	
+	memset(frame_buffer, 0, frame_buffer_length);
 
 	esp_err_t ret = take_photo(frame_buffer, frame_buffer_length);
-while(1) vTaskDelay(1);
+//while(1) vTaskDelay(1);
     
     if (frame_buffer != NULL && frame_buffer_length > 0) {
         ESP_LOGW("main", "[+] УСПЕХ! Аппаратный UXGA JPEG в ОЗУ: %d байт.", frame_buffer_length);

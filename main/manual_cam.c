@@ -49,6 +49,7 @@ static size_t desc_count = 0;
 #define REG_LCD_CLK            (REG_LCD_CAM_BASE + 0x0064) // Регистр тактирования всего блока
 
 esp_err_t take_photo(uint8_t *out_buffer, size_t expected_size) {
+
     periph_module_enable(PERIPH_LCD_CAM_MODULE);
     periph_module_reset(PERIPH_LCD_CAM_MODULE);
 	
@@ -73,7 +74,6 @@ esp_err_t take_photo(uint8_t *out_buffer, size_t expected_size) {
     *cam_ctrl = 0; // Сбрасываем старые настройки
     *cam_ctrl |= (3 << LCD_CAM_LCD_CLK_SEL_S); // Включаем PLL_F160M
     *cam_ctrl |= (6 << LCD_CAM_LCD_CLKM_DIV_NUM_S); // Задаем делитель частоты ядра (160 МГц / 13 ~= 12.3 МГц)
-	*cam_ctrl |= LCD_CAM_CAM_VS_EOF_EN;
 //    *lcd_clk_reg |= (LCD_CAM_LCD_CLKM_DIV_NUM_S); 
     
     // Аппаратно заставляем блок выдавать частоту XCLK непрерывно наружу
@@ -88,7 +88,7 @@ esp_err_t take_photo(uint8_t *out_buffer, size_t expected_size) {
         .speed_mode = LEDC_LOW_SPEED_MODE,
         .timer_num = LEDC_TIMER_1,
         .duty_resolution = LEDC_TIMER_1_BIT, // 1 бит разрешения дает идеальный меандр 50/50
-        .freq_hz = 6000000,                 // Стабильные заводские 12 МГц для OV3660
+        .freq_hz = 12000000,                 // Стабильные заводские 12 МГц для OV3660
         .clk_cfg = LEDC_AUTO_CLK
     };
     ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
@@ -103,43 +103,39 @@ esp_err_t take_photo(uint8_t *out_buffer, size_t expected_size) {
         .hpoint = 0
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+
 //    gpio_reset_pin(CAM_XCLK_IO); // Очищаем любые конфликты с LEDC ШИМ!
 //    gpio_set_direction(CAM_XCLK_IO, GPIO_MODE_OUTPUT);
 //    esp_rom_gpio_connect_out_signal(CAM_XCLK_IO, CAM_CLK_IDX, false, false);
 
+
+    // 1. Сбрасываем и настраиваем пины синхронизации строго на вход
     gpio_reset_pin(CAM_PCLK_IO);
     gpio_set_direction(CAM_PCLK_IO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(CAM_PCLK_IO, GPIO_FLOATING); // Включаем встроенный Pull-up
     esp_rom_gpio_connect_in_signal(CAM_PCLK_IO, CAM_PCLK_IDX, false);
 
     gpio_reset_pin(CAM_HREF_IO);
     gpio_set_direction(CAM_HREF_IO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(CAM_HREF_IO, GPIO_FLOATING);
+    // КРИТИЧЕСКИЙ ФИКС: Используем точное имя индекса CAM_HSYNC_IDX без лишних "_"
     esp_rom_gpio_connect_in_signal(CAM_HREF_IO, CAM_H_SYNC_IDX, false);
 
     gpio_reset_pin(CAM_VSYNC_IO);
     gpio_set_direction(CAM_VSYNC_IO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(CAM_VSYNC_IO, GPIO_FLOATING);
+    // КРИТИЧЕСКИЙ ФИКС: Используем точное имя индекса CAM_VSYNC_IDX
     esp_rom_gpio_connect_in_signal(CAM_VSYNC_IO, CAM_V_SYNC_IDX, false);
 
-//    int pins[] = {CAM_D0_IO, CAM_D1_IO, CAM_D2_IO, CAM_D3_IO, CAM_D4_IO, CAM_D5_IO, CAM_D6_IO, CAM_D7_IO};
-//    uint64_t data_mask = 0;
-//    for(int i=0; i<8; i++) data_mask |= (1ULL << pins[i]);
-    
-//    gpio_config_t io_conf = {
-//        .pin_bit_mask = data_mask | (1ULL << CAM_PCLK_IO) | (1ULL << CAM_HREF_IO) | (1ULL << CAM_VSYNC_IO),
-//        .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE
-//    };
-//    gpio_config(&io_conf);
-
-    // === ПРЯМАЯ КОММУТАЦИЯ GPIO MATRIX БЕЗ СБОЕВ ===
-    // Направляем внутренний сигнал аппаратного генератора частоты камеры CAM_CLK_OUT_IDX
-    // напрямую на нашу физическую ножку GPIO 15! Конфликт LEDC полностью испарился.
-
-    // Подключаем шину данных на вход
-//    for (int i = 0; i < 8; i++) {
-//        esp_rom_gpio_connect_in_signal(pins[i], CAM_DATA_IN0_IDX + i, false);
-//    }
-//    esp_rom_gpio_connect_in_signal(CAM_PCLK_IO, CAM_PCLK_IDX, false);
-//    esp_rom_gpio_connect_in_signal(CAM_HREF_IO, CAM_H_SYNC_IDX, false);
-//    esp_rom_gpio_connect_in_signal(CAM_VSYNC_IO, CAM_V_SYNC_IDX, false);
+    // 2. Сбрасываем и коммутируем перепутанные китайские пины данных D0-D7
+    int data_pins[] = {CAM_D0_IO, CAM_D1_IO, CAM_D2_IO, CAM_D3_IO, CAM_D4_IO, CAM_D5_IO, CAM_D6_IO, CAM_D7_IO};
+    for (int i = 0; i < 8; i++) {
+        gpio_reset_pin(data_pins[i]);
+        gpio_set_direction(data_pins[i], GPIO_MODE_INPUT);
+        gpio_set_pull_mode(data_pins[i], GPIO_FLOATING);
+        // Привязываем физическую ножку платы к соответствующему биту шины LCD_CAM
+        esp_rom_gpio_connect_in_signal(data_pins[i], CAM_DATA_IN0_IDX + i, false);
+    }
 
     // Даем КМОП-генератору камеры 100 мс стабильно потикать новыми аппаратными тактами
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -150,12 +146,14 @@ gpio_set_pull_mode(GPIO_NUM_47, GPIO_PULLUP_ONLY); // Включаем подт�
 
 
     // -------------------------------------------------------------------------
-    // ШАГ 3-6: Настройка геометрии и сброс Async FIFO по даташиту
+    // ШАГ 3-6: Настройка геометрии 
     // -------------------------------------------------------------------------
 //    *cam_ctrl1 &= ~(LCD_CAM_CAM_VH_DE_MODE_EN);  // Clear LCD_CAM_CAM_VH_DE_MODE_EN
 //    *cam_ctrl1 |= (1 << 13);  // VSYNC активный низкий
 //    *cam_ctrl1 &= ~(1 << 14); // HREF активный высокий
 //    *cam_ctrl |= (1 << 22);   // Выставляем бит LCD_CAM_CAM_UPDATE
+	*cam_ctrl |= LCD_CAM_CAM_VS_EOF_EN;
+	*cam_ctrl1 |= LCD_CAM_CAM_UPDATE;
 
     // Сбрасываем асинхронный буфер и блок LCD_CAM
     *cam_ctrl1 |= LCD_CAM_CAM_RESET;  
@@ -166,6 +164,7 @@ gpio_set_pull_mode(GPIO_NUM_47, GPIO_PULLUP_ONLY); // Включаем подт�
 	while(*cam_ctrl1 & LCD_CAM_CAM_AFIFO_RESET){
 		vTaskDelay(1);
 	}
+	// Включаем прерывания
     *cam_int_ena |= (LCD_CAM_CAM_VSYNC_INT_ENA); // Включаем флаг CAM_FRM_DONE_INT
 
     // -------------------------------------------------------------------------
@@ -174,11 +173,7 @@ gpio_set_pull_mode(GPIO_NUM_47, GPIO_PULLUP_ONLY); // Включаем подт�
 	int width = 640;
 	int height = 480;
     *cam_ctrl1 &= ~(0xFFFF); 
-    *cam_ctrl1 |= (width*2 - 1); // Вшиваем длину одной строки (1600 пикселей * 2 байта)
-    *cam_ctrl1 |= (LCD_CAM_CAM_START); // Включаем cam_en (LCD_CAM_CAM_START)
-	*cam_ctrl1 |= LCD_CAM_CAM_UPDATE;
-i2c_init();
-printf("Read 3008 = %u\n", sccb_read(0x3008));
+    *cam_ctrl1 |= (width*2 - 1); // Длина одной строки
 
     gdma_channel_alloc_config_t rx_alloc_config = {
         .flags.isr_cache_safe = true
@@ -202,22 +197,24 @@ printf("Read 3008 = %u\n", sccb_read(0x3008));
         dma_desc_list[i].next = (i == desc_count - 1) ? NULL : &dma_desc_list[i + 1];
     }
 
-    gdma_trigger_t trigger = { .instance_id = SOC_GDMA_TRIG_PERIPH_LCD0, .bus_id = 0};
+    gdma_trigger_t trigger = { .instance_id = SOC_GDMA_TRIG_PERIPH_CAM0, .bus_id = 0};
     gdma_connect(dma_rx_channel, trigger);
 
     // Короткий и чистый запуск линка без лишних структур
     gdma_start(dma_rx_channel, (intptr_t)dma_desc_list);
 
-printf("Read 3008 = %u\n", sccb_read(0x3008));
-init_cam();
-printf("Read 3008 = %u\n", sccb_read(0x3008));
-printf("Temperaure = %u\n", sccb_read(0x6719));
-printf("ID %x%x\n", sccb_read(0x300A), sccb_read(0x300B));
-
     // -------------------------------------------------------------------------
     // ШАГ 8-9: Запуск cam_en и ожидание флага по регистру прерываний
     // -------------------------------------------------------------------------
-    ESP_LOGI(TAG, "[!] Аппаратное тактирование выдает 12 МГц. Включаем cam_en...");
+    *cam_ctrl1 |= (LCD_CAM_CAM_START); // Включаем cam_en (LCD_CAM_CAM_START)
+
+	i2c_init();
+	printf("Read 3008 = %u\n", sccb_read(0x3008));
+	printf("Read 3008 = %u\n", sccb_read(0x3008));
+	init_cam();
+	printf("Read 3008 = %u\n", sccb_read(0x3008));
+	printf("Temperaure = %u\n", sccb_read(0x6719));
+	printf("ID %x%x\n", sccb_read(0x300A), sccb_read(0x300B));
 
     uint32_t safety_timeout = 0;
 uint32_t zero_count = 0;
@@ -225,8 +222,13 @@ uint32_t one_count = 0;
 
     ESP_LOGW(TAG, "[!] Начинаем циклическое чтение тестовой петли VSYNC...");
 
-    while ((*cam_int_st & (1 << 1)) == 0) {
-        // Читаем физическое состояние перемычки на GPIO 47
+
+	//Сбрасываем прерывание
+    *cam_int_clr |= (1 << LCD_CAM_CAM_VSYNC_INT_CLR); 
+printf("Interrupt register 0x%lx\n",*cam_int_st);
+    while ((*cam_int_st & LCD_CAM_CAM_VSYNC_INT_ST ) == 0) {
+        
+        // Считываем физический вольтаж с провода-перемычки на GPIO 47
         int test_vsync_level = gpio_get_level(GPIO_NUM_47);
         
         if (test_vsync_level == 0) {
@@ -238,25 +240,26 @@ uint32_t one_count = 0;
         vTaskDelay(pdMS_TO_TICKS(10));
         safety_timeout += 10;
         
-        // Каждые 500 мс выводим в консоль пропорцию нулей и единиц, которые поймал процессор
+        // Каждые 500 миллисекунд выгружаем пропорцию уровней в консоль Арча
         if (safety_timeout % 500 == 0) {
-            ESP_LOGI(TAG, "[MONITOR] За последние 0.5 сек поймано: НУЛЕЙ=%lu, ЕДИНИЦ=%lu", zero_count, one_count);
+            ESP_LOGI(TAG, "[MONITOR] Проверка петли VSYNC на GPIO 47: НУЛЕЙ=%lu, ЕДИНИЦ=%lu", zero_count, one_count);
             zero_count = 0;
             one_count = 0;
         }
 
-        if (safety_timeout > 4000) { 
-            ESP_LOGE(TAG, "[-] Аппаратный тайм-аут GDMA! Линия кадра так и не ожила.");
+        if (safety_timeout > 10000) { 
+            ESP_LOGE(TAG, "[-] Аппаратный тайм-аут по флагу прерывания! Кадр пропущен.");
+            
             gdma_stop(dma_rx_channel);
             gdma_del_channel(dma_rx_channel);
             gdma_del_channel(dma_tx_channel);
             free(dma_desc_list);
-			shutdown_cam();
-printf("Read 3008 = %u\n", sccb_read(0x3008));
             return ESP_ERR_TIMEOUT;
         }
     }
 
+//shutdown_cam();
+printf("Interrupt register 0x%lx\n",*cam_int_st);
     // Кадр полностью в буфере! Очищаем регистр флага
     *cam_int_clr |= (1 << LCD_CAM_CAM_VSYNC_INT_CLR); 
 
@@ -269,7 +272,6 @@ printf("Read 3008 = %u\n", sccb_read(0x3008));
     ESP_LOGW(TAG, "[SUCCESS] Аппаратное построчное сканирование завершено! Кадр UXGA в PSRAM!");
     return ESP_OK;
 }
-
 
 // Функция ручной записи регистра через НОВЫЙ I2C
 esp_err_t sccb_write(uint16_t reg, uint8_t val) 
@@ -351,151 +353,117 @@ void shutdown_cam(void) {
 void reset_cam()
 {
     sccb_write(0x3008, 0x82); 
+	vTaskDelay(pdMS_TO_TICKS(2));
 }
 
 typedef struct { uint16_t reg; uint8_t val; } reg_val_t;
-static const reg_val_t ov3660_uxga_regs[] = {
-    // 1. Сброс и пробуждение
-//    {0x3008, 0x82}, // Глобальный программный сброс камеры (Software Reset)
-    {0x3008, 0x42}, // Включаем внутреннюю цифровую логику
-    
-    // 2. Настройка тактирования (PLL включен, работает стабильно от ваших 12 МГц)
-    {0x303A, 0x00}, // Включаем PLL (Bypass = 0)
-    {0x3103, 0x03}, // Родной системный делитель ядра
-    
-    // 3. Перевод ножек параллельной шины D0-D7 и синхронизации на ВЫВОД данных
-    {0x3017, 0xff}, 
-    {0x3018, 0xff}, 
-    
-    // 4. Включаем цифровой процессор камеры (ISP) без блокировок
-    {0x501f, 0x01}, // !!! ФИКС: Включаем ISP конвейер (вместо 0x20, который вешал чип)
-    {0x4300, 0x32}, // Формат вывода: UYVY Packed
-    {0x5002, 0x40}, // Включаем цветовую YUV матрицу
-    
-    // 5. ГЕОМЕТРИЯ ОКНА: Настраиваем матрицу на разрешение VGA (640x480)
-    // Без этих регистров счетчик строк камеры просто стоит на месте!
-    {0x3800, 0x00}, {0x3801, 0x00}, // Начало X = 0
-    {0x3802, 0x00}, {0x3803, 0x00}, // Начало Y = 0
-    {0x3804, 0x02}, {0x3805, 0x80}, // Ширина окна (640 в hex -> 0x0280)
-    {0x3806, 0x01}, {0x3807, 0xe0}, // Высота окна (480 в hex -> 0x01E0)
-    {0x3808, 0x02}, {0x3809, 0x80}, // Ширина вывода (Output Width = 640)
-    {0x380a, 0x01}, {0x380b, 0xe0}, // Высота вывода (Output Height = 480)
-    
-    {0x4000, 0x05}, // Включаем автоматическую калибровку черного (BLC)
-    {0x3815, 0x02}, // Настройка полярности VSYNC/HREF
-    
-    // 6. ФИНАЛЬНЫЙ СТАРТ
-    {0x3008, 0x02}, // Wake up! Запускаем конвейер развертки!
-    {0x0000, 0x00}  
-};
+//static const reg_val_t ov3660_uxga_regs[] = {
+//    // 1. Сброс и пробуждение
+////    {0x3008, 0x82}, // Глобальный программный сброс камеры (Software Reset)
+//    {0x3008, 0x42}, // Включаем внутреннюю цифровую логику
+//    
+//    // 2. Настройка тактирования (PLL включен, работает стабильно от ваших 12 МГц)
+//    {0x303A, 0x00}, // Включаем PLL (Bypass = 0)
+//    {0x3103, 0x03}, // Родной системный делитель ядра
+//    
+//    // 3. Перевод ножек параллельной шины D0-D7 и синхронизации на ВЫВОД данных
+//    {0x3017, 0xff}, 
+//    {0x3018, 0xff}, 
+//    
+//    // 4. Включаем цифровой процессор камеры (ISP) без блокировок
+//    {0x501f, 0x01}, // !!! ФИКС: Включаем ISP конвейер (вместо 0x20, который вешал чип)
+//    {0x4300, 0x32}, // Формат вывода: UYVY Packed
+//    {0x5002, 0x40}, // Включаем цветовую YUV матрицу
+//    
+//    // 5. ГЕОМЕТРИЯ ОКНА: Настраиваем матрицу на разрешение VGA (640x480)
+//    // Без этих регистров счетчик строк камеры просто стоит на месте!
+//    {0x3800, 0x00}, {0x3801, 0x00}, // Начало X = 0
+//    {0x3802, 0x00}, {0x3803, 0x00}, // Начало Y = 0
+//    {0x3804, 0x02}, {0x3805, 0x80}, // Ширина окна (640 в hex -> 0x0280)
+//    {0x3806, 0x01}, {0x3807, 0xe0}, // Высота окна (480 в hex -> 0x01E0)
+//    {0x3808, 0x02}, {0x3809, 0x80}, // Ширина вывода (Output Width = 640)
+//    {0x380a, 0x01}, {0x380b, 0xe0}, // Высота вывода (Output Height = 480)
+//    
+//    {0x4000, 0x05}, // Включаем автоматическую калибровку черного (BLC)
+//    {0x3815, 0x02}, // Настройка полярности VSYNC/HREF
+//    
+//    // 6. ФИНАЛЬНЫЙ СТАРТ
+//    {0x3008, 0x02}, // Wake up! Запускаем конвейер развертки!
+//    {0x0000, 0x00}  
+//};
 
-//const reg_val_t ov3660_uxga_regs[] = {
-//    {0x3103, 0x13},
-//    {0x3008, 0x42},
-//    {0x3017, 0xff},
-//    {0x3018, 0xff},
-//    {0x302c, 0xc3},
-//    {0x4740, 0x21},
+const reg_val_t ov3660_uxga_regs[] = {
+	{0x3103, 0x13}, //From predevider 0x11 
+//    {0x3008, 0x42}, 
+    {0x3017, 0xff},	
+    {0x3018, 0xff},
+//    {0x302c, 0xc3}, // Pad driving strength 4x
+//    {0x4740, 0x21},	// VSYNC active high
+
+	// my section
+//	{0x303A, 0x80},
+
+//    {0x3a18, 0x00}, // AEC gain CEILING
+//    {0x3a19, 0xf8}, // AEC GAIN CEILING 
 //
-//    {0x3611, 0x01},
-//    {0x3612, 0x2d},
+//    {0x3000, 0x10}, //Reset for Individual Blocks
+//    {0x3004, 0xef}, // Clock Enable Control for Individual Blocks
 //
-//	{0x3032, 0x00},
-//    {0x3614, 0x80},
-//    {0x3618, 0x00},
-//    {0x3619, 0x75},
-//    {0x3622, 0x80},
-//    {0x3623, 0x00},
-//    {0x3624, 0x03},
-//    {0x3630, 0x52},
-//    {0x3632, 0x07},
-//    {0x3633, 0xd2},
-//    {0x3704, 0x80},
-//    {0x3708, 0x66},
-//    {0x3709, 0x12},
-//    {0x370b, 0x12},
-//    {0x3717, 0x00},
-//    {0x371b, 0x60},
-//    {0x371c, 0x00},
-//    {0x3901, 0x13},
+//    {0x6700, 0x05}, // Temperature Sensor Control Registers 
+//    {0x6701, 0x19}, // Temperature Sensor Control Registers
+//    {0x6702, 0xfd}, // Temperature Sensor Control Registers
+//    {0x6703, 0xd1}, // Temperature Sensor Control Registers
+//    {0x6704, 0xff}, // Temperature Sensor Control Registers
+//    {0x6705, 0xff}, // Temperature Sensor Control Registers
 //
-//    {0x3600, 0x08},
-//    {0x3620, 0x43},
-//    {0x3702, 0x20},
-//    {0x3739, 0x48},
-//    {0x3730, 0x20},
-//    {0x370c, 0x0c},
-//
-//    {0x3a18, 0x00},
-//    {0x3a19, 0xf8},
-//
-//    {0x3000, 0x10},
-//    {0x3004, 0xef},
-//
-//    {0x6700, 0x05},
-//    {0x6701, 0x19},
-//    {0x6702, 0xfd},
-//    {0x6703, 0xd1},
-//    {0x6704, 0xff},
-//    {0x6705, 0xff},
-//
-//    {0x3c01, 0x80},
-//    {0x3c00, 0x04},
+//	//anti-flicker section
+//    {0x3c01, 0x80}, // sigmadelta/5060Hz detector
+//    {0x3c00, 0x04},// sigmadelta/5060Hz detector
 //    {0x3a08, 0x00}, {0x3a09, 0x62}, //50Hz Band Width Step (10bit)
 //    {0x3a0e, 0x08}, //50Hz Max Bands in One Frame (6 bit)
 //    {0x3a0a, 0x00}, {0x3a0b, 0x52}, //60Hz Band Width Step (10bit)
 //    {0x3a0d, 0x09}, //60Hz Max Bands in One Frame (6 bit)
 //
 //    {0x3a00, 0x3a},//night mode off
-//    {0x3a14, 0x09},
-//    {0x3a15, 0x30},
-//    {0x3a02, 0x09},
-//    {0x3a03, 0x30},
+//    {0x3a14, 0x09}, // 50Hz Maximum Exposure Output Limit
+//    {0x3a15, 0x30}, // 50Hz Maximum Exposure Output Limit
+//    {0x3a02, 0x09}, // 60Hz Maximum Exposure Output Limit
+//    {0x3a03, 0x30}, // 60Hz Maximum Exposure Output Limit
 //
-//    {0x440e, 0x08},
-//    {0x4520, 0x0b},
-//    {0x460b, 0x37},
-//    {0x4713, 0x02},
-//    {0x471c, 0xd0},
-//    {0x5086, 0x00},
+//    {0x440e, 0x08}, // COMPRESSION CTRL0E
+//    {0x4713, 0x02}, // Compression mode select
 //
-//    {0x5002, 0x00},
-//    {0x501f, 0x00},
+//    {0x501f, 0x00}, // Format Control (YUV422)
 //
-//    {0x3008, 0x02},
+//	
+//	// AWB
+//    {0x5180, 0xff}, // AWB CONTROL 00
+//    {0x5181, 0xf2}, // AWB CONTROL 01
+//    {0x5182, 0x00}, // AWB CONTROL 02
+//    {0x5183, 0x14},	// AWB CONTROL 03
+//    {0x5184, 0x25}, // AWB CONTROL 04
+//    {0x5185, 0x24}, // AWB CONTROL 05
+//    {0x5186, 0x16}, // Advanced AWB Control
+//    {0x5187, 0x16}, // Advanced AWB Control    
+//    {0x5188, 0x16}, // Advanced AWB Control    
+//    {0x5189, 0x68}, // Advanced AWB Control    
+//    {0x518a, 0x60}, // Advanced AWB Control    
+//    {0x518b, 0xe0}, // Advanced AWB Control    
+//    {0x518c, 0xb2}, // Advanced AWB Control    
+//    {0x518d, 0x42}, // Advanced AWB Control    
+//    {0x518e, 0x35}, // Advanced AWB Control    
+//    {0x518f, 0x56}, // Advanced AWB Control    
+//    {0x5190, 0x56}, // Advanced AWB Control    
+//    {0x5191, 0xf8}, // AWB top limit
+//    {0x5192, 0x04}, // AWB bottom limit
+//    {0x5193, 0x70}, // Red limit
+//    {0x5194, 0xf0}, // Green limit
+//    {0x5195, 0xf0}, // Blue limit
+//    {0x5196, 0x03}, // AWB CONTROL 22
+//    {0x5197, 0x01}, // AWB CONTROL 23 (Local limit)
+//    {0x519e, 0x38}, // AWB CONTROL 30
 //
-//    {0x5180, 0xff},
-//    {0x5181, 0xf2},
-//    {0x5182, 0x00},
-//    {0x5183, 0x14},
-//    {0x5184, 0x25},
-//    {0x5185, 0x24},
-//    {0x5186, 0x16},
-//    {0x5187, 0x16},
-//    {0x5188, 0x16},
-//    {0x5189, 0x68},
-//    {0x518a, 0x60},
-//    {0x518b, 0xe0},
-//    {0x518c, 0xb2},
-//    {0x518d, 0x42},
-//    {0x518e, 0x35},
-//    {0x518f, 0x56},
-//    {0x5190, 0x56},
-//    {0x5191, 0xf8},
-//    {0x5192, 0x04},
-//    {0x5193, 0x70},
-//    {0x5194, 0xf0},
-//    {0x5195, 0xf0},
-//    {0x5196, 0x03},
-//    {0x5197, 0x01},
-//    {0x5198, 0x04},
-//    {0x5199, 0x12},
-//    {0x519a, 0x04},
-//    {0x519b, 0x00},
-//    {0x519c, 0x06},
-//    {0x519d, 0x82},
-//    {0x519e, 0x38},
-//
+//	// CMX control registers
 //    {0x5381, 0x1d},
 //    {0x5382, 0x60},
 //    {0x5383, 0x03},
@@ -508,25 +476,30 @@ static const reg_val_t ov3660_uxga_regs[] = {
 //    {0x538a, 0x01},
 //    {0x538b, 0x98},
 //
+//	//gamma control registers
 //    {0x5480, 0x01},
-////    {0x5481, 0x05},
-////    {0x5482, 0x09},
-////    {0x5483, 0x10},
-////    {0x5484, 0x3a},
-////    {0x5485, 0x4c},
-////    {0x5486, 0x5a},
-////    {0x5487, 0x68},
-////    {0x5488, 0x74},
-////    {0x5489, 0x80},
-////    {0x548a, 0x8e},
-////    {0x548b, 0xa4},
-////    {0x548c, 0xb4},
-////    {0x548d, 0xc8},
-////    {0x548e, 0xde},
-////    {0x548f, 0xf0},
-////    {0x5490, 0x15},
+//	//    {0x5481, 0x05},
+//	//    {0x5482, 0x09},
+//	//    {0x5483, 0x10},
+//	//    {0x5484, 0x3a},
+//	//    {0x5485, 0x4c},
+//	//    {0x5486, 0x5a},
+//	//    {0x5487, 0x68},
+//	//    {0x5488, 0x74},
+//	//    {0x5489, 0x80},
+//	//    {0x548a, 0x8e},
+//	//    {0x548b, 0xa4},
+//	//    {0x548c, 0xb4},
+//	//    {0x548d, 0xc8},
+//	//    {0x548e, 0xde},
+//	//    {0x548f, 0xf0},
+//	//    {0x5490, 0x15},
 //
+//	//	ISP general control registers
 //    {0x5000, 0xa7},
+//
+//	// LENC control registers
+//	// GREEN MATRIX
 //    {0x5800, 0x0C},
 //    {0x5801, 0x09},
 //    {0x5802, 0x0C},
@@ -563,6 +536,7 @@ static const reg_val_t ov3660_uxga_regs[] = {
 //    {0x5821, 0x10},
 //    {0x5822, 0x10},
 //    {0x5823, 0x1E},
+//	// Blue & RED Matrix
 //    {0x5824, 0x53},
 //    {0x5825, 0x15},
 //    {0x5826, 0x05},
@@ -588,25 +562,32 @@ static const reg_val_t ov3660_uxga_regs[] = {
 //    {0x583a, 0x15},
 //    {0x583b, 0x25},
 //    {0x583c, 0x53},
+//	// LENC BR OFFSET
 //    {0x583d, 0xCF},
 //
+//	//step of the exposure/gain adjustmen
 //    {0x3a0f, 0x30},
 //    {0x3a10, 0x28},
+//
+//	// Shaman settings
 //    {0x3a1b, 0x30},
 //    {0x3a1e, 0x28},
 //    {0x3a11, 0x60},
 //    {0x3a1f, 0x14},
 //
-//    {0x5302, 0x28},
-//    {0x5303, 0x20},
+//	
+//    {0x5302, 0x28}, // CIP SHARPENMT OFFSET1
+//    {0x5303, 0x20}, // CIP SHARPENMT OFFSET2
 //
 //    {0x5306, 0x1c}, //de-noise offset 1
 //    {0x5307, 0x28}, //de-noise offset 2
 //
-//    {0x4002, 0xc5},
+//	// black level calibration (BLC)
+//    {0x4002, 0xc5}, 
 //    {0x4003, 0x81},
 //    {0x4005, 0x12},
 //
+//	// average control
 //    {0x5688, 0x11},
 //    {0x5689, 0x11},
 //    {0x568a, 0x11},
@@ -616,26 +597,29 @@ static const reg_val_t ov3660_uxga_regs[] = {
 //    {0x568e, 0x11},
 //    {0x568f, 0x11},
 //
+//	// auto color saturation adjust
 //    {0x5580, 0x06},
 //    {0x5588, 0x00},
 //    {0x5583, 0x40},
 //    {0x5584, 0x2c},
 //
 //    {0x5001, 0x83}, // turn color matrix, awb and SDE
-//
-//    // Маркер окончания массива конфигурации
-//    {0x0000, 0x00}
-//};
+
+    {0x503D, 0x80}, // TEST PATTERN
+    {0x3008, 0x02}, 
+    // Маркер окончания массива конфигурации
+    {0x0000, 0x00}
+};
 
 void init_cam()
 {
 //enable_cam();
 //vTaskDelay(pdMS_TO_TICKS(10));
 reset_cam();
-vTaskDelay(pdMS_TO_TICKS(10));
     int idx = 0;
     while (ov3660_uxga_regs[idx].reg != 0x0000) {
-//        sccb_write(ov3660_uxga_regs[idx].reg, ov3660_uxga_regs[idx].val);
+        sccb_write(ov3660_uxga_regs[idx].reg, ov3660_uxga_regs[idx].val);
+		//vTaskDelay(1);
         idx++;
     }
 }
