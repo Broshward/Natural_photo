@@ -84,35 +84,35 @@ esp_err_t take_photo(uint8_t *out_buffer, size_t expected_size) {
     // -------------------------------------------------------------------------
     // Включаем GPIO 15 (XCLK) в режим обычного вывода
 	    // Настраиваем полностью независимую периферию LEDC ШИМ для выдачи 12 МГц на GPIO 15
-    ledc_timer_config_t ledc_timer = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .timer_num = LEDC_TIMER_1,
-        .duty_resolution = LEDC_TIMER_1_BIT, // 1 бит разрешения дает идеальный меандр 50/50
-        .freq_hz = 12000000,                 // Стабильные заводские 12 МГц для OV3660
-        .clk_cfg = LEDC_AUTO_CLK
-    };
-    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+//    ledc_timer_config_t ledc_timer = {
+//        .speed_mode = LEDC_LOW_SPEED_MODE,
+//        .timer_num = LEDC_TIMER_1,
+//        .duty_resolution = LEDC_TIMER_1_BIT, // 1 бит разрешения дает идеальный меандр 50/50
+//        .freq_hz = 20000000,                 // Стабильные заводские 12 МГц для OV3660
+//        .clk_cfg = LEDC_AUTO_CLK
+//    };
+//    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+//
+//    ledc_channel_config_t ledc_channel = {
+//        .speed_mode = LEDC_LOW_SPEED_MODE,
+//        .channel = LEDC_CHANNEL_1,
+//        .timer_sel = LEDC_TIMER_1,
+//        .intr_type = LEDC_INTR_DISABLE,
+//        .gpio_num = CAM_XCLK_IO,             // Наш физический пин GPIO 15
+//        .duty = 1,                           // Половина от 1-битного таймера (меандр)
+//        .hpoint = 0
+//    };
+//    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 
-    ledc_channel_config_t ledc_channel = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel = LEDC_CHANNEL_1,
-        .timer_sel = LEDC_TIMER_1,
-        .intr_type = LEDC_INTR_DISABLE,
-        .gpio_num = CAM_XCLK_IO,             // Наш физический пин GPIO 15
-        .duty = 1,                           // Половина от 1-битного таймера (меандр)
-        .hpoint = 0
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
-
-//    gpio_reset_pin(CAM_XCLK_IO); // Очищаем любые конфликты с LEDC ШИМ!
-//    gpio_set_direction(CAM_XCLK_IO, GPIO_MODE_OUTPUT);
-//    esp_rom_gpio_connect_out_signal(CAM_XCLK_IO, CAM_CLK_IDX, false, false);
+    gpio_reset_pin(CAM_XCLK_IO); // Очищаем любые конфликты с LEDC ШИМ!
+    gpio_set_direction(CAM_XCLK_IO, GPIO_MODE_OUTPUT);
+    esp_rom_gpio_connect_out_signal(CAM_XCLK_IO, CAM_CLK_IDX, false, false);
 
 
     // 1. Сбрасываем и настраиваем пины синхронизации строго на вход
     gpio_reset_pin(CAM_PCLK_IO);
     gpio_set_direction(CAM_PCLK_IO, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(CAM_PCLK_IO, GPIO_FLOATING); // Включаем встроенный Pull-up
+    gpio_set_pull_mode(CAM_PCLK_IO, GPIO_PULLDOWN_ONLY); // Включаем встроенный Pull-up
     esp_rom_gpio_connect_in_signal(CAM_PCLK_IO, CAM_PCLK_IDX, false);
 
     gpio_reset_pin(CAM_HREF_IO);
@@ -197,7 +197,7 @@ gpio_set_pull_mode(GPIO_NUM_47, GPIO_PULLUP_ONLY); // Включаем подт�
         dma_desc_list[i].next = (i == desc_count - 1) ? NULL : &dma_desc_list[i + 1];
     }
 
-    gdma_trigger_t trigger = { .instance_id = SOC_GDMA_TRIG_PERIPH_CAM0, .bus_id = 0};
+    gdma_trigger_t trigger = { .instance_id = SOC_GDMA_TRIG_PERIPH_CAM0, .bus_id = SOC_GDMA_BUS_AHB};
     gdma_connect(dma_rx_channel, trigger);
 
     // Короткий и чистый запуск линка без лишних структур
@@ -226,29 +226,30 @@ uint32_t one_count = 0;
 	//Сбрасываем прерывание
     *cam_int_clr |= (1 << LCD_CAM_CAM_VSYNC_INT_CLR); 
 printf("Interrupt register 0x%lx\n",*cam_int_st);
-    while ((*cam_int_st & LCD_CAM_CAM_VSYNC_INT_ST ) == 0) {
+        // Номер нашего самого последнего дескриптора строки (для VGA 480 строк -> индекс 479)
+    size_t final_desc_idx = desc_count - 1; 
+
+    // Цикл крутится, пока последний дескриптор принадлежит железу (owner == 1).
+    // Так как HREF и PCLK работают регулярно, робот GDMA начнет лавиной закрывать 
+    // дескрипторы строк, и этот цикл мгновенно и успешно завершится!
+    while (dma_desc_list[final_desc_idx].dw0.owner == 1) {
         
-        // Считываем физический вольтаж с провода-перемычки на GPIO 47
-        int test_vsync_level = gpio_get_level(GPIO_NUM_47);
-        
-        if (test_vsync_level == 0) {
-            zero_count++;
-        } else {
-            one_count++;
+        // Каждые 500 мс выводим в консоль реальный прогресс: сколько СТРОК 
+        // кадра прямо сейчас физически скачалось в память смартфона!
+        if (safety_timeout % 500 == 0) {
+            size_t current_row = 0;
+            // Считаем, сколько дескрипторов строк робот GDMA уже отдал процессору (owner == 0)
+            while (current_row < desc_count && dma_desc_list[current_row].dw0.owner == 0) {
+                current_row++;
+            }
+            ESP_LOGI(TAG, "[MONITOR PROGRESS] Успешно скачано строк: %d из %d", current_row, desc_count);
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
         safety_timeout += 10;
         
-        // Каждые 500 миллисекунд выгружаем пропорцию уровней в консоль Арча
-        if (safety_timeout % 500 == 0) {
-            ESP_LOGI(TAG, "[MONITOR] Проверка петли VSYNC на GPIO 47: НУЛЕЙ=%lu, ЕДИНИЦ=%lu", zero_count, one_count);
-            zero_count = 0;
-            one_count = 0;
-        }
-
-        if (safety_timeout > 10000) { 
-            ESP_LOGE(TAG, "[-] Аппаратный тайм-аут по флагу прерывания! Кадр пропущен.");
+        if (safety_timeout > 4000) { 
+            ESP_LOGE(TAG, "[-] Аппаратный тайм-аут GDMA! Робот застрял. Проверим прогресс строк выше.");
             
             gdma_stop(dma_rx_channel);
             gdma_del_channel(dma_rx_channel);
@@ -397,11 +398,13 @@ const reg_val_t ov3660_uxga_regs[] = {
 //    {0x3008, 0x42}, 
     {0x3017, 0xff},	
     {0x3018, 0xff},
-//    {0x302c, 0xc3}, // Pad driving strength 4x
-//    {0x4740, 0x21},	// VSYNC active high
+    {0x302c, 0xc3}, // Pad driving strength 4x
+    {0x4740, 0x21},	// VSYNC active high
 
 	// my section
 //	{0x303A, 0x80},
+//	{0x460C, 0x01},
+//	{0x3824, 0x04},
 
 //    {0x3a18, 0x00}, // AEC gain CEILING
 //    {0x3a19, 0xf8}, // AEC GAIN CEILING 

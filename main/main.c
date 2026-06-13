@@ -255,7 +255,7 @@ void app_main(void)
 	memset(frame_buffer, 0, frame_buffer_length);
 
 	esp_err_t ret = take_photo(frame_buffer, frame_buffer_length);
-//while(1) vTaskDelay(1);
+while(1) vTaskDelay(1);
     
     if (frame_buffer != NULL && frame_buffer_length > 0) {
         ESP_LOGW("main", "[+] УСПЕХ! Аппаратный UXGA JPEG в ОЗУ: %d байт.", frame_buffer_length);
