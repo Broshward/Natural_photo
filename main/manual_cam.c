@@ -13,8 +13,9 @@
 #include "soc/gpio_sig_map.h"
 #include "driver/i2c_master.h"
 #include "esp_private/periph_ctrl.h" // КРИТИЧЕСКИ ВАЖНО: Дает доступ к включению тактов ядра
+#include "soc/gpio_reg.h"
 
-static const char *TAG = "manual_cam";
+static const char *TAG = "pure_hardware_cam";
 
 static i2c_master_dev_handle_t cam_i2c_handle = NULL; // Хэндл нового I2C (для SCCB)
 
@@ -23,256 +24,127 @@ void shutdown_cam(void);
 void init_cam();
 void reset_cam();
 
-// Структура аппаратного дескриптора GDMA процессора S3
-typedef struct gdma_descr_s {
-    struct {
-        uint32_t size : 12;         // Размер буфера ноды
-        uint32_t length : 12;       // Сколько реально записано
-        uint32_t reversed : 6;
-        uint32_t err_out : 1;
-        uint32_t owner : 1;         // 1 - дескриптор принадлежит аппаратному GDMA
-    } dw0;
-    uint8_t *buffer;                // Указатель на физический кусок памяти в PSRAM
-    struct gdma_descr_s *next;      // Ссылка на следующий дескриптор (Link List)
-} gdma_descr_t;
-
-// Переменные для хэндлов нового драйвера
-static gdma_channel_handle_t dma_tx_channel = NULL; // Заглушка, передача не нужна
-static gdma_channel_handle_t dma_rx_channel = NULL; // Наш рабочий канал приема
-static gdma_descr_t *dma_desc_list = NULL;
-static size_t desc_count = 0;
-
-#define REG_LCD_CAM_BASE       0x60041000 
-#define REG_CAM_CTRL           (REG_LCD_CAM_BASE + 0x0004)
-#define REG_CAM_CTRL1          (REG_LCD_CAM_BASE + 0x0008)
-#define REG_CAM_RGB_YUV        (REG_LCD_CAM_BASE + 0x000C)
-#define REG_LCD_CLK            (REG_LCD_CAM_BASE + 0x0064) // Регистр тактирования всего блока
 
 esp_err_t take_photo(uint8_t *out_buffer, size_t expected_size) {
+    ESP_LOGW(TAG, "[START] Запуск чистого ручного захвата кадра без периферии!");
 
-    periph_module_enable(PERIPH_LCD_CAM_MODULE);
-    periph_module_reset(PERIPH_LCD_CAM_MODULE);
-	
-
-    ESP_LOGW(TAG, "[START] Конфигурация RX-режима LCD_CAM по даташиту...");
-
-    volatile uint32_t *cam_ctrl = (volatile uint32_t *)LCD_CAM_CAM_CTRL_REG;
-    volatile uint32_t *cam_ctrl1 = (volatile uint32_t *)LCD_CAM_CAM_CTRL1_REG;
-    volatile uint32_t *lcd_clk_reg = (volatile uint32_t *)LCD_CAM_LCD_CLOCK_REG;
-    volatile uint32_t *cam_int_st = (volatile uint32_t *)LCD_CAM_LC_DMA_INT_ST_REG;
-    volatile uint32_t *cam_int_clr = (volatile uint32_t *)LCD_CAM_LC_DMA_INT_CLR_REG;
-    volatile uint32_t *cam_int_ena = (volatile uint32_t *)(LCD_CAM_LC_DMA_INT_ENA_REG);
-
-    // -------------------------------------------------------------------------
-    // ШАГ 1: Конфигурация аппаратного тактирования БЕЗ LEDC ШИМ
-    // -------------------------------------------------------------------------
-    // Настраиваем регистр REG_LCD_CLK (0x0064). 
-    // Бит 24 = 1 -> выбираем стабильный источник тактирования PLL_F160M (160 МГц).
-    // Биты 14..21 (lcd_clkm_div_num) задают базовый делитель частоты.
-    // Биты 0..5 (cam_clkm_div_b) и 6..11 (cam_clkm_div_a) задают точную дробную настройку.
-    // Выставляем коэффициенты так, чтобы получить чистые, стабильные 12 МГц на выходе.
-    *cam_ctrl = 0; // Сбрасываем старые настройки
-    *cam_ctrl |= (3 << LCD_CAM_LCD_CLK_SEL_S); // Включаем PLL_F160M
-    *cam_ctrl |= (6 << LCD_CAM_LCD_CLKM_DIV_NUM_S); // Задаем делитель частоты ядра (160 МГц / 13 ~= 12.3 МГц)
-//    *lcd_clk_reg |= (LCD_CAM_LCD_CLKM_DIV_NUM_S); 
-    
-    // Аппаратно заставляем блок выдавать частоту XCLK непрерывно наружу
-//    *cam_ctrl |= (1 << 24); // Включаем бит cam_clk_sel непрерывного вывода тактов
-
-    // -------------------------------------------------------------------------
-    // ШАГ 2: Конфигурация сигнальных пинов и привязка к GPIO Matrix
-    // -------------------------------------------------------------------------
-    // Включаем GPIO 15 (XCLK) в режим обычного вывода
-	    // Настраиваем полностью независимую периферию LEDC ШИМ для выдачи 12 МГц на GPIO 15
-//    ledc_timer_config_t ledc_timer = {
-//        .speed_mode = LEDC_LOW_SPEED_MODE,
-//        .timer_num = LEDC_TIMER_1,
-//        .duty_resolution = LEDC_TIMER_1_BIT, // 1 бит разрешения дает идеальный меандр 50/50
-//        .freq_hz = 20000000,                 // Стабильные заводские 12 МГц для OV3660
-//        .clk_cfg = LEDC_AUTO_CLK
-//    };
-//    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
-//
-//    ledc_channel_config_t ledc_channel = {
-//        .speed_mode = LEDC_LOW_SPEED_MODE,
-//        .channel = LEDC_CHANNEL_1,
-//        .timer_sel = LEDC_TIMER_1,
-//        .intr_type = LEDC_INTR_DISABLE,
-//        .gpio_num = CAM_XCLK_IO,             // Наш физический пин GPIO 15
-//        .duty = 1,                           // Половина от 1-битного таймера (меандр)
-//        .hpoint = 0
-//    };
-//    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
-
-    gpio_reset_pin(CAM_XCLK_IO); // Очищаем любые конфликты с LEDC ШИМ!
-    gpio_set_direction(CAM_XCLK_IO, GPIO_MODE_OUTPUT);
-    esp_rom_gpio_connect_out_signal(CAM_XCLK_IO, CAM_CLK_IDX, false, false);
-
-
-    // 1. Сбрасываем и настраиваем пины синхронизации строго на вход
-    gpio_reset_pin(CAM_PCLK_IO);
-    gpio_set_direction(CAM_PCLK_IO, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(CAM_PCLK_IO, GPIO_PULLDOWN_ONLY); // Включаем встроенный Pull-up
-    esp_rom_gpio_connect_in_signal(CAM_PCLK_IO, CAM_PCLK_IDX, false);
-
-    gpio_reset_pin(CAM_HREF_IO);
-    gpio_set_direction(CAM_HREF_IO, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(CAM_HREF_IO, GPIO_FLOATING);
-    // КРИТИЧЕСКИЙ ФИКС: Используем точное имя индекса CAM_HSYNC_IDX без лишних "_"
-    esp_rom_gpio_connect_in_signal(CAM_HREF_IO, CAM_H_SYNC_IDX, false);
-
-    gpio_reset_pin(CAM_VSYNC_IO);
-    gpio_set_direction(CAM_VSYNC_IO, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(CAM_VSYNC_IO, GPIO_FLOATING);
-    // КРИТИЧЕСКИЙ ФИКС: Используем точное имя индекса CAM_VSYNC_IDX
-    esp_rom_gpio_connect_in_signal(CAM_VSYNC_IO, CAM_V_SYNC_IDX, false);
-
-    // 2. Сбрасываем и коммутируем перепутанные китайские пины данных D0-D7
-    int data_pins[] = {CAM_D0_IO, CAM_D1_IO, CAM_D2_IO, CAM_D3_IO, CAM_D4_IO, CAM_D5_IO, CAM_D6_IO, CAM_D7_IO};
-    for (int i = 0; i < 8; i++) {
-        gpio_reset_pin(data_pins[i]);
-        gpio_set_direction(data_pins[i], GPIO_MODE_INPUT);
-        gpio_set_pull_mode(data_pins[i], GPIO_FLOATING);
-        // Привязываем физическую ножку платы к соответствующему биту шины LCD_CAM
-        esp_rom_gpio_connect_in_signal(data_pins[i], CAM_DATA_IN0_IDX + i, false);
-    }
-
-    // Даем КМОП-генератору камеры 100 мс стабильно потикать новыми аппаратными тактами
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-gpio_reset_pin(GPIO_NUM_47);
-gpio_set_direction(GPIO_NUM_47, GPIO_MODE_INPUT);
-gpio_set_pull_mode(GPIO_NUM_47, GPIO_PULLUP_ONLY); // Включаем подтяжку
-
-
-    // -------------------------------------------------------------------------
-    // ШАГ 3-6: Настройка геометрии 
-    // -------------------------------------------------------------------------
-//    *cam_ctrl1 &= ~(LCD_CAM_CAM_VH_DE_MODE_EN);  // Clear LCD_CAM_CAM_VH_DE_MODE_EN
-//    *cam_ctrl1 |= (1 << 13);  // VSYNC активный низкий
-//    *cam_ctrl1 &= ~(1 << 14); // HREF активный высокий
-//    *cam_ctrl |= (1 << 22);   // Выставляем бит LCD_CAM_CAM_UPDATE
-	*cam_ctrl |= LCD_CAM_CAM_VS_EOF_EN;
-	*cam_ctrl1 |= LCD_CAM_CAM_UPDATE;
-
-    // Сбрасываем асинхронный буфер и блок LCD_CAM
-    *cam_ctrl1 |= LCD_CAM_CAM_RESET;  
-	while(*cam_ctrl1 & LCD_CAM_CAM_RESET){
-		vTaskDelay(1);
-	} 
-	*cam_ctrl1 |= LCD_CAM_CAM_AFIFO_RESET;
-	while(*cam_ctrl1 & LCD_CAM_CAM_AFIFO_RESET){
-		vTaskDelay(1);
-	}
-	// Включаем прерывания
-    *cam_int_ena |= (LCD_CAM_CAM_VSYNC_INT_ENA); // Включаем флаг CAM_FRM_DONE_INT
-
-    // -------------------------------------------------------------------------
-    // ШАГ 7: Настройка 16-битного построчного лимита BYTELEN и GDMA
-    // -------------------------------------------------------------------------
-	int width = 640;
-	int height = 480;
-    *cam_ctrl1 &= ~(0xFFFF); 
-    *cam_ctrl1 |= (width*2 - 1); // Длина одной строки
-
-    gdma_channel_alloc_config_t rx_alloc_config = {
-        .flags.isr_cache_safe = true
+    // 1. НАСТРОЙКА ЧИСТОГО ШИМ ДЛЯ XCLK (12 МГц через LEDC остается)
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = LEDC_TIMER_1,
+        .duty_resolution = LEDC_TIMER_1_BIT, .freq_hz = 6000000, .clk_cfg = LEDC_AUTO_CLK
     };
-    if (gdma_new_ahb_channel(&rx_alloc_config, &dma_tx_channel, &dma_rx_channel) != ESP_OK) {
-        return ESP_FAIL;
-    }
+    ledc_timer_config(&ledc_timer);
+    ledc_channel_config_t ledc_channel = {
+        .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_1, .timer_sel = LEDC_TIMER_1,
+        .intr_type = LEDC_INTR_DISABLE, .gpio_num = CAM_XCLK_IO, .duty = 1, .hpoint = 0
+    };
+    ledc_channel_config(&ledc_channel);
+    vTaskDelay(pdMS_TO_TICKS(150)); // Даем камере стабильно прогреться тактами
+init_cam();
 
-    // Нарезаем 3.8 МБ PSRAM на цепочку из 1200 дескрипторов (по 3200 байт на строку)
-    size_t node_size = width*2; 
-    desc_count = height;       
-    dma_desc_list = heap_caps_malloc(desc_count * sizeof(gdma_descr_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    // 2. НАСТРОЙКА ВСЕХ ПИНОВ ШИНЫ КАМЕРЫ КАК ОБЫЧНЫЕ ЦИФРОВЫЕ ВХОДЫ
+    int pins[] = {CAM_D0_IO, CAM_D1_IO, CAM_D2_IO, CAM_D3_IO, CAM_D4_IO, CAM_D5_IO, CAM_D6_IO, CAM_D7_IO};
+    uint64_t data_mask = 0;
+    for(int i=0; i<8; i++) data_mask |= (1ULL << pins[i]);
     
-    for (size_t i = 0; i < desc_count; i++) {
-        dma_desc_list[i].dw0.size = node_size;
-        dma_desc_list[i].dw0.length = 0;
-        dma_desc_list[i].dw0.reversed = 0;
-        dma_desc_list[i].dw0.err_out = 0;
-        dma_desc_list[i].dw0.owner = 1; 
-        dma_desc_list[i].buffer = out_buffer + (i * node_size); // Каждая нода берет свою строку кадра
-        dma_desc_list[i].next = (i == desc_count - 1) ? NULL : &dma_desc_list[i + 1];
-    }
+    gpio_config_t io_conf = {
+        .pin_bit_mask = data_mask | (1ULL << CAM_PCLK_IO) | (1ULL << CAM_HREF_IO) | (1ULL << CAM_VSYNC_IO),
+        .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
 
-    gdma_trigger_t trigger = { .instance_id = SOC_GDMA_TRIG_PERIPH_CAM0, .bus_id = SOC_GDMA_BUS_AHB};
-    gdma_connect(dma_rx_channel, trigger);
+    // Указатель на 32-битный аппаратный регистр, где лежат живые уровни ВСЕХ ножек процессора одновременно!
+    volatile uint32_t *gpio_in_reg = (volatile uint32_t *)GPIO_IN_REG;
 
-    // Короткий и чистый запуск линка без лишних структур
-    gdma_start(dma_rx_channel, (intptr_t)dma_desc_list);
+    // Считаем параметры под наше VGA разрешение (640х480)
+    size_t total_bytes_to_read = 2048 * 1536 * 2; // 614 400 байт кадра
+    size_t bytes_collected = 0;
+	uint32_t flags = 0;
+	size_t hrefs_collecteg = 0;
 
-    // -------------------------------------------------------------------------
-    // ШАГ 8-9: Запуск cam_en и ожидание флага по регистру прерываний
-    // -------------------------------------------------------------------------
-    *cam_ctrl1 |= (LCD_CAM_CAM_START); // Включаем cam_en (LCD_CAM_CAM_START)
-
-	i2c_init();
-	printf("Read 3008 = %u\n", sccb_read(0x3008));
-	printf("Read 3008 = %u\n", sccb_read(0x3008));
-	init_cam();
-	printf("Read 3008 = %u\n", sccb_read(0x3008));
-	printf("Temperaure = %u\n", sccb_read(0x6719));
-	printf("ID %x%x\n", sccb_read(0x300A), sccb_read(0x300B));
-
-    uint32_t safety_timeout = 0;
-uint32_t zero_count = 0;
-uint32_t one_count = 0;
-
-    ESP_LOGW(TAG, "[!] Начинаем циклическое чтение тестовой петли VSYNC...");
-
-
-	//Сбрасываем прерывание
-    *cam_int_clr |= (1 << LCD_CAM_CAM_VSYNC_INT_CLR); 
-printf("Interrupt register 0x%lx\n",*cam_int_st);
-        // Номер нашего самого последнего дескриптора строки (для VGA 480 строк -> индекс 479)
-    size_t final_desc_idx = desc_count - 1; 
-
-    // Цикл крутится, пока последний дескриптор принадлежит железу (owner == 1).
-    // Так как HREF и PCLK работают регулярно, робот GDMA начнет лавиной закрывать 
-    // дескрипторы строк, и этот цикл мгновенно и успешно завершится!
-    while (dma_desc_list[final_desc_idx].dw0.owner == 1) {
-        
-        // Каждые 500 мс выводим в консоль реальный прогресс: сколько СТРОК 
-        // кадра прямо сейчас физически скачалось в память смартфона!
-        if (safety_timeout % 500 == 0) {
-            size_t current_row = 0;
-            // Считаем, сколько дескрипторов строк робот GDMA уже отдал процессору (owner == 0)
-            while (current_row < desc_count && dma_desc_list[current_row].dw0.owner == 0) {
-                current_row++;
-            }
-            ESP_LOGI(TAG, "[MONITOR PROGRESS] Успешно скачано строк: %d из %d", current_row, desc_count);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
-        safety_timeout += 10;
-        
-        if (safety_timeout > 4000) { 
-            ESP_LOGE(TAG, "[-] Аппаратный тайм-аут GDMA! Робот застрял. Проверим прогресс строк выше.");
-            
-            gdma_stop(dma_rx_channel);
-            gdma_del_channel(dma_rx_channel);
-            gdma_del_channel(dma_tx_channel);
-            free(dma_desc_list);
+    // 3. ЖДЕМ СИНХРОНИЗАЦИЮ: НАЧАЛО НОВОГО КАДРА (VSYNC)
+    ESP_LOGI(TAG, "[!] Ждём VSYNC."); 
+    
+    uint32_t vsync_timeout = 0;
+    // Ждем, пока на линии VSYNC висит единица (камера заканчивает старый кадр)
+    while(gpio_get_level(CAM_VSYNC_IO) == 1) {
+        esp_rom_delay_us(1);
+        if(++vsync_timeout > 16000000) { // Исключаем зависание
+            ESP_LOGE(TAG, "[-] Камера не отвечает по VSYNC!");
             return ESP_ERR_TIMEOUT;
         }
     }
 
-//shutdown_cam();
-printf("Interrupt register 0x%lx\n",*cam_int_st);
-    // Кадр полностью в буфере! Очищаем регистр флага
-    *cam_int_clr |= (1 << LCD_CAM_CAM_VSYNC_INT_CLR); 
+    ESP_LOGI(TAG, "[!] VSYNC пришёл. Ждём начало кадра...");
+    // Выключаем планировщик FreeRTOS, чтобы операционная система не отвлекала 
+    vTaskSuspendAll(); 
+    // Ждем спад в ноль — это железный сигнал: «Внимание, пошел новый кадр!»
+    while(gpio_get_level(CAM_VSYNC_IO) == 0) {
+        esp_rom_delay_us(1);
+    }
 
-    *cam_ctrl &= ~(1 << 21); // Гасим cam_en
-    gdma_stop(dma_rx_channel);
-    gdma_del_channel(dma_rx_channel);
-    gdma_del_channel(dma_tx_channel);
-    free(dma_desc_list);
+    //ESP_LOGW(TAG, "[!] Кадр пошел! Включаем высокоскоростной цикл чтения ножек...");
+    // наш процессор своими делами во время наносекундного съема пикселей!
+    // 4. ГЛАВНЫЙ СУПЕР-ЦИКЛ: ХАКЕРСКИЙ BIT-BANGING
+    while (1) {
+        
+        // Ждем, когда линия HREF поднимется в единицу (пошла валидная строка пикселей)
+        // Если HREF упал в 0, мы просто пропускаем паузу между строками
+        if (gpio_get_level(CAM_HREF_IO) == 1) {
+            
+            // Ждем передний фронт пиксельного такта PCLK (переход из 0 в 1)
+            // Именно в этот момент камера выставляет честный вольтаж на пины D0-D7
+            while (gpio_get_level(CAM_PCLK_IO) == 0) {
+                // Крутим пустой микро-цикл ожидания такта
+            }
 
-    ESP_LOGW(TAG, "[SUCCESS] Аппаратное построчное сканирование завершено! Кадр UXGA в PSRAM!");
+            // --- МОМЕНТ ИСТИНЫ: ЧИТАЕМ ВСЕ ПИНЫ ЗА 1 ТАКТ ЯДРА ---
+            uint32_t live_gpio_state = *gpio_in_reg;
+
+            // Расшифровываем биты. Мы вытягиваем состояние каждой ножки из общего регистра
+            // и бережно склеиваем их обратно в один готовый 8-битный байт пикселя!
+            uint8_t pixel_byte = 
+                (((live_gpio_state >> 11) & 0x01) << 0) | // D0 (GPIO 11) -> бит 0
+                (((live_gpio_state >> 9)  & 0x01) << 1) | // D1 (GPIO 9)  -> бит 1
+                (((live_gpio_state >> 8)  & 0x01) << 2) | // D2 (GPIO 8)  -> бит 2 (уже на месте, просто маскируем)
+                (((live_gpio_state >> 10) & 0x01) << 3) | // D3 (GPIO 10) -> бит 3
+                (((live_gpio_state >> 12) & 0x01) << 4) | // D4 (GPIO 12) -> бит 4
+                (((live_gpio_state >> 18) & 0x01) << 5) | // D5 (GPIO 18) -> бит 5
+                (((live_gpio_state >> 17) & 0x01) << 6) | // D6 (GPIO 17) -> бит 6
+                (((live_gpio_state >> 16) & 0x01) << 7);  // D7 (GPIO 16) -> бит 7
+            // Кладем добытый байт прямо в нашу PSRAM
+            out_buffer[bytes_collected] = pixel_byte;
+            bytes_collected++;
+
+            // Ждем, пока такт PCLK опустится обратно в ноль, чтобы не прочесть один и тот же байт дважды
+            while (gpio_get_level(CAM_PCLK_IO) == 1) {
+                // Ждем спад такта
+            }
+        } else {
+			hrefs_collecteg++;
+            // Если мы вылетели из строки (HREF == 0), проверяем, не кончился ли кадр по VSYNC
+			while(gpio_get_level(CAM_HREF_IO) == 0){
+				if (gpio_get_level(CAM_VSYNC_IO) == 0) {
+					// Камера завершила кадр раньше, чем мы ожидали — выходим из цикла!
+					flags |= 1;
+					break;
+				}
+			}
+			if (flags & 1) break;
+        }
+    }
+
+    // Возвращаем операционную систему к жизни
+    xTaskResumeAll();
+	if (flags & 1){
+		ESP_LOGW(TAG, "[!] Камера завершила кадр раньше, чем мы ожидали!");
+	}
+	//shutdown_cam();
+    ESP_LOGW(TAG, "[SUCCESS] Ручной хардварный кадр завершен! Процессор собрал %d байт.", bytes_collected);
+    ESP_LOGW(TAG, "[SUCCESS] Ручной хардварный кадр завершен! Количество строк %d.", hrefs_collecteg);
     return ESP_OK;
 }
+
 
 // Функция ручной записи регистра через НОВЫЙ I2C
 esp_err_t sccb_write(uint16_t reg, uint8_t val) 
@@ -402,8 +274,11 @@ const reg_val_t ov3660_uxga_regs[] = {
     {0x4740, 0x21},	// VSYNC active high
 
 	// my section
-//	{0x303A, 0x80},
-//	{0x460C, 0x01},
+//	{0x303A, 0x80}, // PLL bypass
+	{0x303B, 0x02}, // PLL multiplier
+	{0x303d, 0x33}, // PLL divider
+	{0x501f, 0x00}, // YUV422
+//	{0x460C, 0x01}, 
 //	{0x3824, 0x04},
 
 //    {0x3a18, 0x00}, // AEC gain CEILING
@@ -616,13 +491,15 @@ const reg_val_t ov3660_uxga_regs[] = {
 
 void init_cam()
 {
-//enable_cam();
-//vTaskDelay(pdMS_TO_TICKS(10));
-reset_cam();
+	i2c_init();
+	reset_cam();
     int idx = 0;
     while (ov3660_uxga_regs[idx].reg != 0x0000) {
         sccb_write(ov3660_uxga_regs[idx].reg, ov3660_uxga_regs[idx].val);
 		//vTaskDelay(1);
         idx++;
     }
+	printf("Read 3008 = %u\n", sccb_read(0x3008));
+	printf("Temperaure = %u\n", sccb_read(0x6719));
+	printf("ID %x%x\n", sccb_read(0x300A), sccb_read(0x300B));
 }

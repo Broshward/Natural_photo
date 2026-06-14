@@ -250,12 +250,12 @@ void app_main(void)
     ESP_LOGW("main", "=== ЗАПУСК СЕССИИ ФОТОАППАРАТА ===");
 
     // Выделяем буфер под честный UXGA YUV422 в наших 8 МБ PSRAM
-    size_t frame_buffer_length = 640 * 480 * 2; // Ровно 3 840 000 байт
+    size_t frame_buffer_length = 2048 * 1536 * 2; // Ровно 3 840 000 байт
     uint8_t *frame_buffer = heap_caps_malloc(frame_buffer_length, MALLOC_CAP_SPIRAM);	
 	memset(frame_buffer, 0, frame_buffer_length);
 
 	esp_err_t ret = take_photo(frame_buffer, frame_buffer_length);
-while(1) vTaskDelay(1);
+//while(1) vTaskDelay(1);
     
     if (frame_buffer != NULL && frame_buffer_length > 0) {
         ESP_LOGW("main", "[+] УСПЕХ! Аппаратный UXGA JPEG в ОЗУ: %d байт.", frame_buffer_length);
@@ -319,7 +319,8 @@ while(1) vTaskDelay(1);
                 vTaskDelay(pdMS_TO_TICKS(15));
             } 
             // Отладка без карты: шлем текущий UXGA буфер из памяти, если сервер просит кадр №1
-            else if (i == boot_count && last_sent_index == 0 && frame_buffer != NULL && frame_buffer_length > 0) {
+            else if (i == boot_count && frame_buffer != NULL && frame_buffer_length > 0) {
+            //else if (i == boot_count && last_sent_index == 0 && frame_buffer != NULL && frame_buffer_length > 0) {
                 if (send_file(frame_buffer, frame_buffer_length, 1)) { 
                     last_sent_index = i; 
                 }
