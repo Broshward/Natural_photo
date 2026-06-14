@@ -17,6 +17,8 @@
 #include "driver/sdmmc_host.h"
 #include "driver/gpio.h"
 #include "ff.h"
+#include "driver/sdspi_host.h" // ВКЛЮЧАЕМ ДРАЙВЕР SPI ДЛЯ КАРТЫ ПАМЯТИ
+#include "driver/spi_common.h"
 
 // Сеть и OTA
 #include "esp_wifi.h"
@@ -166,34 +168,33 @@ camera_fb_t* take_photo(void) {
         return NULL;
     }
     
-	ESP_LOGI(TAG, "Temperature of camera %u", read_sensor_reg(0x6719));
-	ESP_LOGI(TAG, "Compression enable %u", read_sensor_reg(0x3821));
-	ESP_LOGI(TAG, "Compression MODE %u", read_sensor_reg(0x4713));
-	ESP_LOGI(TAG, "SCCB_ID %u", read_sensor_reg(0x4713));
-    vTaskDelay(pdMS_TO_TICKS(1000)); // Даем камере перестроиться на черепаший шаг
-    audit_ov3660_pll();
-
-    ESP_LOGW("main_cam", "[!] Включаем PLL Bypass по фэншую. Замедление PCLK...");
-
-    // 2. ОТКЛЮЧАЕМ PLL МАТРИЦЫ (ВКЛЮЧАЕМ BYPASS) ИЗ ВАШЕЙ ТАБЛИЦЫ!
-    // Запись бита 7 в 1 полностью отключает умножитель. 
-    // Частота пикселей PCLK станет равна нашим чистым, медленным 10 МГц!
-    write_sensor_reg(0x303A, 0x80); 
+//	ESP_LOGI(TAG, "Temperature of camera %u", read_sensor_reg(0x6719));
+//	ESP_LOGI(TAG, "Compression enable %u", read_sensor_reg(0x3821));
+//	ESP_LOGI(TAG, "Compression MODE %u", read_sensor_reg(0x4713));
+//	ESP_LOGI(TAG, "SCCB_ID %u", read_sensor_reg(0x4713));
+//    vTaskDelay(pdMS_TO_TICKS(1000)); // Даем камере перестроиться на черепаший шаг
+//    audit_ov3660_pll();
+//
+//    ESP_LOGW("main_cam", "[!] Включаем PLL Bypass по фэншую. Замедление PCLK...");
+//
+//    // 2. ОТКЛЮЧАЕМ PLL МАТРИЦЫ (ВКЛЮЧАЕМ BYPASS) ИЗ ВАШЕЙ ТАБЛИЦЫ!
+//    // Запись бита 7 в 1 полностью отключает умножитель. 
+//    // Частота пикселей PCLK станет равна нашим чистым, медленным 10 МГц!
+//    write_sensor_reg(0x303A, 0x80); 
+//    
+//    vTaskDelay(pdMS_TO_TICKS(200)); // Даем стабилизироваться кадрам
+//
+//    // Прогреваем матрицу
+//    for (int i = 0; i < 2; i++) {
+//        camera_fb_t *fb_flush = esp_camera_fb_get();
+//        if (fb_flush) esp_camera_fb_return(fb_flush);
+//        vTaskDelay(pdMS_TO_TICKS(100));
+//    }
     
-    vTaskDelay(pdMS_TO_TICKS(200)); // Даем стабилизироваться кадрам
-
-    // Прогреваем матрицу
-    for (int i = 0; i < 2; i++) {
-        camera_fb_t *fb_flush = esp_camera_fb_get();
-        if (fb_flush) esp_camera_fb_return(fb_flush);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    
-    // Хватаем наш идеальный, небитый UXGA JPEG!
     camera_fb_t *fb_real = esp_camera_fb_get();
     
     if (fb_real) {
-        ESP_LOGW("main_cam", "[SUCCESS] Кадр UXGA JPEG успешно захвачен! Вес файла: %d байт.", fb_real->len);
+        ESP_LOGW("main_cam", "[SUCCESS] Кадр успешно захвачен! Вес файла: %d байт.", fb_real->len);
     } else {
         hardware_errors_mask |= 0x02;
     }
@@ -320,9 +321,9 @@ bool send_file(uint8_t *buf, size_t len, uint32_t index) {
 }
 
 // Функция динамического поиска последнего индекса на SD-карте
-int get_last_file_index_from_sd(void) {
+int get_last_file_index_from_sd(void) 
+{
     sdmmc_card_t* card;
-    if (init_sd_card(&card) != ESP_OK) return 0;
     
     int index = 1;
     char path[64];
@@ -330,14 +331,13 @@ int get_last_file_index_from_sd(void) {
     
     // Перебираем имена, пока stat находит файл
     while (index < 99999) {
-        snprintf(path, sizeof(path), "%s/plant_%d.raw", MOUNT_POINT, index);
+        snprintf(path, sizeof(path), "%s/%05d.raw", MOUNT_POINT, index);
         if (stat(path, &st) != 0) {
             break; // Файл не найден, значит предыдущий индекс был последним
         }
         index++;
     }
     
-    esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
     return index - 1;
 }
 
@@ -361,9 +361,18 @@ void app_main(void) {
     ESP_LOGI(TAG, "[+] Камера полностью обесточена. Переходим к сетевым задачам.");
 
     // 2. Инициализируем SD-карту один раз
-    bool sd_ok = (init_sd_card(&global_card_handle) == ESP_OK);
+    esp_err_t sd_status = init_sd_card(&global_card_handle);
+	bool sd_ok;
+	if (sd_status == ESP_OK) {
+		ESP_LOGI(TAG, "Карта смонтирована!");
+		sd_ok=true;
+	} else {
+		ESP_LOGE(TAG, "SD-card mount error: %d", sd_status);
+		sd_ok = false;
+	}
     if (sd_ok) {
         boot_count = get_last_file_index_from_sd() + 1;
+		ESP_LOGI(TAG, "[+] Last file in the card %d", boot_count);
         
         // Пишем на карту, только если кадр не пустой (маска ошибок не содержит 0x02)
         if (!(hardware_errors_mask & 0x02) && fb->buf && fb->len > 0) {
