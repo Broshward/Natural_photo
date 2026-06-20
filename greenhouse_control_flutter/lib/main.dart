@@ -245,30 +245,30 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-          const Text("Эта операция полностью сотрет все файлы на SD-карте платы. Данное действие необратимо!"),
-const SizedBox(height: 15),
-TextField(
-controller: _dialogController,
-decoration: const InputDecoration(labelText: "Введите проверочное слово 'format'"),
-)
-],
-),
-actions: [
-TextButton(onPressed: () => Navigator.pop(context), child: const Text("ОТМЕНА")),
-ElevatedButton(
-style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-onPressed: () {
-if (_dialogController.text.trim().toLowerCase() == "format") {
-setState(() { _formatRequested = true; _statusText = "Запрос очистки взведен. Ожидание платы..."; });
-Navigator.pop(context);
-}
-},
-child: const Text("СТЕРЕТЬ ВСЁ"),
-)
-],
-),
-);
-}
+            const Text("Эта операция полностью сотрет все файлы на SD-карте платы. Данное действие необратимо!"),
+            const SizedBox(height: 15),
+            TextField(
+              controller: _dialogController,
+              decoration: const InputDecoration(labelText: "Введите проверочное слово 'format'"),
+            )
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("ОТМЕНА")),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () {
+              if (_dialogController.text.trim().toLowerCase() == "format") {
+                setState(() { _formatRequested = true; _statusText = "Запрос очистки взведен. Ожидание платы..."; });
+                Navigator.pop(context);
+              }
+            },
+            child: const Text("СТЕРЕТЬ ВСЁ"),
+          )
+        ],
+      ),
+    );
+  }
 
   void _showOtaDialog() {
     _dialogController.clear();

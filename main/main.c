@@ -36,7 +36,7 @@ static const char *TAG = "greenhouse_cam";
 #define SERVER_IP           "192.168.43.1" 
 #define SERVER_PORT         8888
 
-#define TARGET_PERIOD_SEC   600             
+#define TARGET_PERIOD_SEC   600
 #define MOUNT_POINT         "/sdcard"
 
 // Пины Freenove V1695
@@ -67,6 +67,8 @@ static sdmmc_card_t* global_card_handle = NULL;
 
 // Битовая маска системного лога ошибок (0 — все идеально)
 static uint32_t hardware_errors_mask = 0; 
+RTC_DATA_ATTR static int mode = 0;
+RTC_DATA_ATTR static uint64_t time_to_sleep_enter = 0;
 
 
 static camera_config_t camera_config = {
@@ -138,7 +140,7 @@ static uint8_t read_sensor_reg(uint16_t reg) {
 }
 
 void shutdown_greenhouse_camera(void) {
-    ESP_LOGW("main_cam", "[!] Отправляем OV3660 в программный Standby (40 мкА)...");
+    ESP_LOGW("main_cam", "[!] Отправляем камеру в программный PowerDown...");
     
     // Включаем бит 6 в регистре 0x3008, полностью обесточивая матрицу и объектив!
     write_sensor_reg(0x3008, 0x40); 
@@ -183,13 +185,13 @@ camera_fb_t* take_photo(void) {
 //    write_sensor_reg(0x303A, 0x80); 
 //    
 //    vTaskDelay(pdMS_TO_TICKS(200)); // Даем стабилизироваться кадрам
-//
-//    // Прогреваем матрицу
-//    for (int i = 0; i < 2; i++) {
-//        camera_fb_t *fb_flush = esp_camera_fb_get();
-//        if (fb_flush) esp_camera_fb_return(fb_flush);
-//        vTaskDelay(pdMS_TO_TICKS(100));
-//    }
+
+    // Прогреваем матрицу
+    for (int i = 0; i < 2; i++) {
+        camera_fb_t *fb_flush = esp_camera_fb_get();
+        if (fb_flush) esp_camera_fb_return(fb_flush);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
     
     camera_fb_t *fb_real = esp_camera_fb_get();
     
@@ -323,8 +325,6 @@ bool send_file(uint8_t *buf, size_t len, uint32_t index) {
 // Функция динамического поиска последнего индекса на SD-карте
 int get_last_file_index_from_sd(void) 
 {
-    sdmmc_card_t* card;
-    
     int index = 1;
     char path[64];
     struct stat st;
@@ -343,105 +343,153 @@ int get_last_file_index_from_sd(void)
 
 // --- БЛОК 4: ИДЕАЛЬНЫЙ СУПЕР-ЛИНЕЙНЫЙ КОНВЕЙЕР ---
 void app_main(void) {
+//	uint64_t actual_sleep_time_us = esp_deep_sleep_get_actual_time_to_sleep();
     uint64_t session_start_us = esp_timer_get_time();
+	ESP_LOGW(TAG, "Begin time %lu", session_start_us);
+
     hardware_errors_mask = 0; 
 
     gpio_config_t io_conf = { .pin_bit_mask = (1ULL << 48), .mode = GPIO_MODE_OUTPUT, .pull_up_en = 0, .pull_down_en = 1 };
     gpio_config(&io_conf); gpio_set_level(48, 0);
 
-    nvs_flash_init();
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK( ret );
 
-    // 1. Снимаем плановый кадр во временный буфер DMA камеры
-    camera_fb_t *fb = take_photo();
-    
-    // ПРИНУДИТЕЛЬНО ТУШИМ КАМЕРУ! Она проработала всего 2 секунды. 
-    // Линия 3.3 В разгружена, никакого нагрева и риска сжечь новую SD-карту в процессе Wi-Fi сессии!
-	shutdown_greenhouse_camera();
 
-    ESP_LOGI(TAG, "[+] Камера полностью обесточена. Переходим к сетевым задачам.");
 
-    // 2. Инициализируем SD-карту один раз
-    esp_err_t sd_status = init_sd_card(&global_card_handle);
-	bool sd_ok;
-	if (sd_status == ESP_OK) {
-		ESP_LOGI(TAG, "Карта смонтирована!");
-		sd_ok=true;
-	} else {
-		ESP_LOGE(TAG, "SD-card mount error: %d", sd_status);
-		sd_ok = false;
+	camera_fb_t *fb = NULL;
+	bool sd_ok = false;
+	uint32_t wakeup_mask = esp_sleep_get_wakeup_causes();
+	
+	int mode_prev = mode;
+	// Mode calculating
+	// mode = 0  Photo and save mode. Timer mode. This is ordinary mode. 
+	// mode = 1  Photo mode. Button press mode. Photo & download. Этот mode для настройки камеры. Он делает фото и сразу отправляет его на смартфон. Turns on with a short press of the button
+	// mode = 2  Hold button mode (Download mode). This mode uses for download files. Turns on with a long  press of the button
+	// mode = 3  Greenhouse mode (Photo, saving and download mode). Это режим для теплицы. Кнопка игнорируется. Turns on with uncomment line below 
+	ESP_LOGI(TAG, "PIN 0 is %d", gpio_get_level(0));
+	if (wakeup_mask & (1 << ESP_SLEEP_WAKEUP_TIMER)) // По таймеру 
+		mode = 0; // Timer mode (Photo and save mode). This is ordinary mode.  
+	else if (wakeup_mask & (1 << ESP_SLEEP_WAKEUP_EXT0)) {
+		if (gpio_get_level(0)) {
+			mode = 1; // Button mode (Download mode) This mode uses for download files. 
+			boot_count = 1;
+		} else {
+			mode = 2; // Hold button mode (Setting mode). Этот mode для настройки камеры. Только фото и отправка  
+			printf("*");
+			while (!gpio_get_level(0)) {vTaskDelay(pdMS_TO_TICKS(100));}
+		}
 	}
-    if (sd_ok) {
-        boot_count = get_last_file_index_from_sd() + 1;
-		ESP_LOGI(TAG, "[+] Last file in the card %d", boot_count);
-        
-        // Пишем на карту, только если кадр не пустой (маска ошибок не содержит 0x02)
-        if (!(hardware_errors_mask & 0x02) && fb->buf && fb->len > 0) {
-            if (!save_photo_to_sd(fb, boot_count)) {
-                hardware_errors_mask |= 0x04;
-            }
-        }
-    } else {
-        hardware_errors_mask |= 0x04; 
-        boot_count++;
-    }
+	mode = 3; //Greenhouse mode (Photo, saving and download mode). Это режим для теплицы. Кнопка игнорируется. Включается только так.
+	ESP_LOGW(TAG, "The mode is %d", mode);
 
-    // 3. Сетевой блок (Запускается в любом случае, даже если камера сдохла — чтобы передать лог!)
-    if (wifi_init_sta()) {
-        ESP_LOGI(TAG, "Wi-Fi ОК. Передача лога ошибок: 0x%X", hardware_errors_mask);
+	if (mode == 0 || mode == 1 || mode == 3) { 
+		// 1. Снимаем плановый кадр во временный буфер
+		fb = take_photo();
+		// ПРИНУДИТЕЛЬНО ТУШИМ КАМЕРУ! 
+		shutdown_greenhouse_camera();
+		ESP_LOGI(TAG, "[+] Камера полностью обесточена. Переходим к сетевым задачам.");
+	}
 
-        // Сетевой диалог А: Холостой пинг синхронизации
-        server_requested_index = -1;
-        send_info(boot_count);
+    // 2. Инициализируем SD-карту 
+	if (mode==0 || mode == 2 || mode == 3) {
+	    esp_err_t sd_status = init_sd_card(&global_card_handle);
+		if (sd_status == ESP_OK) {
+			ESP_LOGI(TAG, "Карта смонтирована!");
+			sd_ok=true;
+		} else {
+			ESP_LOGE(TAG, "SD-card mount error: %d", sd_status);
+			sd_ok = false;
+		}
+	    if (sd_ok) {
+	        boot_count = get_last_file_index_from_sd() + 1;
+			ESP_LOGI(TAG, "[+] Last file in the card %d", boot_count);
+	        
+	        // Пишем на карту, только если кадр не пустой(маска ошибок не содержит 0x02) и только если обычный mode(0)
+	        if (!(hardware_errors_mask & 0x02) && (mode == 0) && fb && fb->buf && fb->len > 0) {
+	            if (!save_photo_to_sd(fb, boot_count)) {
+	                hardware_errors_mask |= 0x04;
+	            }
+	        }
+	    } else {
+	        hardware_errors_mask |= 0x04; 
+	    }
+	}
 
-        if (server_requested_index != -1) {
-            last_sent_index = server_requested_index;
-        }
+	if (mode_prev != 0) // Это может быть, если выгрузка файлов прервалась таймером
+		mode = mode_prev;
+    // 3. Сетевой блок (Запускается только если нажатие на кнопку(не таймер))
+	//if (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER) {
+	if(mode == 1 || mode == 2 || mode == 3) {
+		if (wifi_init_sta()) {
+			ESP_LOGI(TAG, "Wi-Fi ОК. Передача лога ошибок: 0x%X", hardware_errors_mask);
 
-        // ЗАЩИТА: Если камера или флешка выдали критическую аварию, 
-        // не мучаем систему отправкой очереди, а сразу завершаем сессию
-        if (!(hardware_errors_mask & 0x03)) { 
-            
-            // Сетевой диалог Б: Потоковая выгрузка архива истории
-            for (int i = last_sent_index + 1; i <= boot_count; i++) {
-                uint64_t total_elapsed_sec = (esp_timer_get_time() - session_start_us) / 1000000ULL;
-                if (total_elapsed_sec >= (TARGET_PERIOD_SEC - 20)) { 
-                    ESP_LOGE(TAG, "Динамический таймер прервал очередь сессии.");
-                    break; 
-                }
+			// Сетевой диалог А: Холостой пинг синхронизации
+			send_info(boot_count);
 
-                uint8_t *file_buf = NULL; size_t file_size = 0;
+			if (server_requested_index != -1) {
+				last_sent_index = server_requested_index;
+			}
+			if (mode == 1)
+				last_sent_index = -1;
 
-                if (sd_ok && !(hardware_errors_mask & 0x04)) {
-                    char file_path[32]; struct stat st;
-                    snprintf(file_path, sizeof(file_path), "%s/%05d.raw", MOUNT_POINT, i);
-                    if (stat(file_path, &st) == 0) {
-                        file_size = st.st_size;
-                        file_buf = heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
-                        if (file_buf) {
-                            FILE *f = fopen(file_path, "rb");
-                            if (f) { fread(file_buf, 1, file_size, f); fclose(f); }
-                        }
-                    }
-                }
+			// ЗАЩИТА: Если камера или флешка выдали критическую аварию, 
+			// не мучаем систему отправкой очереди, а сразу завершаем сессию
+			if (!(hardware_errors_mask & 0x03)) { 
+				// Сетевой диалог Б: Потоковая выгрузка архива истории
+				bool mode_change = true;
+				for (int i = last_sent_index + 1; i <= boot_count; i++) {
+					uint64_t total_elapsed_sec = (esp_timer_get_time() - session_start_us) / 1000000ULL;
+					if (total_elapsed_sec >= (TARGET_PERIOD_SEC - 20)) { 
+						ESP_LOGE(TAG, "Динамический таймер прервал очередь сессии.");
+						mode_change = false;
+						break; 
+					}
 
-                if (file_buf && file_size > 0) {
-                    if (!send_file(file_buf, file_size, i)) { heap_caps_free(file_buf); break; }
-                    last_sent_index = i;
-                    heap_caps_free(file_buf);
-                    vTaskDelay(pdMS_TO_TICKS(15));
-                } else if (i == boot_count && fb->buf && fb->len > 0) {
-                    if (send_file(fb->buf, fb->len, i)) { last_sent_index = i; }
-                }
-            }
-        }
-    }
+					uint8_t *file_buf = NULL; size_t file_size = 0;
+
+					if (sd_ok && !(hardware_errors_mask & 0x04)) {
+						char file_path[32]; struct stat st;
+						snprintf(file_path, sizeof(file_path), "%s/%05d.raw", MOUNT_POINT, i);
+
+						if (stat(file_path, &st) == 0) {
+							file_size = st.st_size;
+							file_buf = heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
+							if (file_buf) {
+								FILE *f = fopen(file_path, "rb");
+								if (f) { fread(file_buf, 1, file_size, f); fclose(f); }
+							}
+						}
+						ESP_LOGI(TAG, "File %s upload", file_path);
+					}
+
+					if (file_buf && file_size > 0) {
+						if (!send_file(file_buf, file_size, i)) { 
+							heap_caps_free(file_buf); 
+							break; 
+						}
+						last_sent_index = i;
+						heap_caps_free(file_buf);
+						vTaskDelay(pdMS_TO_TICKS(15));
+					} else if (i == boot_count && fb && fb->buf && fb->len > 0) {
+						if (send_file(fb->buf, fb->len, i)) { last_sent_index = i; }
+					}
+				}
+				if (mode_change) mode = 0;
+			}
+			esp_wifi_stop();
+		}
+	}
 
 	//Буфер камеры больше не нужен
 	esp_camera_fb_return(fb); 
     esp_camera_deinit(); 
 	
     // --- ФИНАЛЬНЫЙ СИНХРОННЫЙ УХОД В СОН (БЕЗ МЕТОК) ---
-    esp_wifi_stop();
 
     if (sd_ok && global_card_handle) {
         if (format_requested) { 
@@ -461,45 +509,6 @@ void app_main(void) {
 
     ESP_LOGW(TAG, "Ухожу в глубокий сон на %d сек.", sleep_time_sec);
     esp_sleep_enable_timer_wakeup((uint64_t)sleep_time_sec * 1000000LL);
+	if (mode == 0 || mode == 1) esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
     esp_deep_sleep_start();
 }
-    
-
-
-// Код для проверки причины выхода из сна. Если при нажатии кнопки, то включаем вайфай, если по таймеру, то не включаем. 
-//void app_main(void) {
-//    uint64_t session_start_us = esp_timer_get_time();
-//    hardware_errors_mask = 0;
-//
-//    // Считываем аппаратно причину, почему процессор включился
-//    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-//
-//    // Создаем флаг: запускать Wi-Fi или нет
-//    bool need_wifi = false;
-//
-//    if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
-//        // Проснулись планово по таймеру — Wi-Fi НЕ НУЖЕН, экономим батарею!
-//        need_wifi = false;
-//        ESP_LOGI(TAG, "Плановое пробуждение по таймеру. Снимаем и спим.");
-//    } else {
-//        // Проснулись после сброса питания (Power-On Reset) или нажатия кнопки RESET!
-//        // Включаем Wi-Fi, чтобы хозяин мог забрать фотографии со смартфона
-//        need_wifi = true;
-//        ESP_LOGW(TAG, "[!] РУЧНОЙ СТАРТ (RESET). Включаем Wi-Fi и ждем Flutter-пульт!");
-//    }
-//
-//    // ... (Далее идет съемка кадра take_photo() и запись на SD-карту) ...
-//
-//    // Модифицируем шаг №3 (Сетевой блок)
-//    // Wi-Fi инициализируется и запускается ТОЛЬКО если need_wifi == true
-//    if (need_wifi && wifi_init_sta()) {
-//        ESP_LOGI(TAG, "Wi-Fi активен в ручном режиме. Потоковая выгрузка архива...");
-//        
-//        // ... (Здесь идет весь наш сетевой диалог А и Б: send_info, send_file) ...
-//        
-//    } else if (need_wifi) {
-//        ESP_LOGE(TAG, "Не удалось подключиться к смартфону при ручном старте.");
-//    }
-//
-//    // И всё! Если need_wifi был false, плата просто пропустит весь тяжелый сетевой блок 
-//    // и мгновенно перейдет к метке sleep, потратив минимум энергии!
