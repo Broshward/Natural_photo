@@ -205,7 +205,8 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
         final rawYuvBytes = Uint8List.fromList(imagePayload.sublist(0, imgSize));
         
         // ВЫЗЫВАЕМ НАШ ИСПРАВЛЕННЫЙ КОНВЕРТЕР ЦВЕТОВ ОV3660
-        final convertedJpeg = convertYuv422ToJpeg(rawYuvBytes, 1024, 768);
+        final convertedJpeg = convertYuv422ToJpeg(rawYuvBytes, 1280, 1024);
+        //final convertedJpeg = convertYuv422ToJpeg(rawYuvBytes, 1024, 768);
 
         try {
           final extDir = await getExternalStorageDirectory();
@@ -259,7 +260,7 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
             style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
             onPressed: () {
               if (_dialogController.text.trim().toLowerCase() == "format") {
-                setState(() { _formatRequested = true; _statusText = "Запрос очистки взведен. Ожидание платы..."; });
+                setState(() { _formatRequested = true; _statusText = "Запрос очистки. Ожидание платы..."; });
                 Navigator.pop(context);
               }
             },
@@ -307,56 +308,56 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
 
 @override
 Widget build(BuildContext context) {
-return Scaffold(
-appBar: AppBar(title: const Text('Greenhouse Control Пульт')),
-body: Padding(
-padding: const EdgeInsets.all(12.0),
-child: Column(
-children: [
-Expanded(
-child: Container(
-width: double.infinity,
-decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(8)),
-child: _jpegBytes != null
-? Image.memory(_jpegBytes!, fit: BoxFit.contain)
-: const Center(child: Text("Ожидание теплицы...", style: TextStyle(color: Colors.grey))),
-),
-),
-const SizedBox(height: 15),
-Text(_statusText, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold), textAlign: TextAlign.center),
-const SizedBox(height: 5),
-Text(_queueText, style: TextStyle(fontSize: 15, color: _queueText.contains("Авария") ? Colors.redAccent : Colors.white70, fontWeight: _queueText.contains("Авария") ? FontWeight.bold : FontWeight.normal)),
-const SizedBox(height: 5),
-Text(_batteryText, style: const TextStyle(fontSize: 15, color: Colors.greenAccent)),
-const SizedBox(height: 15),
-SizedBox(
-width: double.infinity,
-height: 48,
-child: ElevatedButton(
-style: ElevatedButton.styleFrom(backgroundColor: Colors.grey),
-onPressed: _showFormatDialog,
-child: const Text("ОЧИСТИТЬ ФЛЭШКУ НА ПЛАТЕ", style: TextStyle(fontSize: 14, color: Colors.white)),
-),
-),
-const SizedBox(height: 10),
-SizedBox(
-width: double.infinity,
-height: 44,
-child: OutlinedButton(
-style: OutlinedButton.styleFrom(
-side: BorderSide(color: _otaMode ? Colors.blue : Colors.redAccent),
-backgroundColor: _otaMode ? Colors.blue.withOpacity(0.1) : Colors.transparent,
-),
-onPressed: _showOtaDialog,
-child: Text(
-_otaMode ? "ОБНОВЛЕНИЕ ПО: В ЖДУЩЕМ РЕЖИМЕ..." : "ОБНОВИТЬ ПРОШИВКУ (OTA)",
-style: TextStyle(color: _otaMode ? Colors.blue : Colors.redAccent, fontWeight: FontWeight.bold),
-),
-),
-),
-],
-),
-),
-);
-}
+  return Scaffold(
+    appBar: AppBar(title: const Text('Greenhouse Control Пульт')),
+    body: Padding(
+      padding: const EdgeInsets.all(12.0),
+      child: Column(
+      children: [
+      Expanded(
+      child: Container(
+      width: double.infinity,
+      decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(8)),
+      child: _jpegBytes != null
+      ? Image.memory(_jpegBytes!, fit: BoxFit.contain)
+      : const Center(child: Text("Ожидание теплицы...", style: TextStyle(color: Colors.grey))),
+      ),
+      ),
+      const SizedBox(height: 15),
+      Text(_statusText, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold), textAlign: TextAlign.center),
+      const SizedBox(height: 5),
+      Text(_queueText, style: TextStyle(fontSize: 15, color: _queueText.contains("Авария") ? Colors.redAccent : Colors.white70, fontWeight: _queueText.contains("Авария") ? FontWeight.bold : FontWeight.normal)),
+      const SizedBox(height: 5),
+      Text(_batteryText, style: const TextStyle(fontSize: 15, color: Colors.greenAccent)),
+      const SizedBox(height: 15),
+      SizedBox(
+      width: double.infinity,
+      height: 48,
+      child: ElevatedButton(
+      style: ElevatedButton.styleFrom(backgroundColor: Colors.grey),
+      onPressed: _showFormatDialog,
+      child: const Text("ОЧИСТИТЬ ФЛЭШКУ НА ПЛАТЕ", style: TextStyle(fontSize: 14, color: Colors.white)),
+      ),
+      ),
+      const SizedBox(height: 10),
+      SizedBox(
+      width: double.infinity,
+      height: 44,
+      child: OutlinedButton(
+      style: OutlinedButton.styleFrom(
+      side: BorderSide(color: _otaMode ? Colors.blue : Colors.redAccent),
+      backgroundColor: _otaMode ? Colors.blue.withOpacity(0.1) : Colors.transparent,
+      ),
+      onPressed: _showOtaDialog,
+      child: Text(
+      _otaMode ? "ОБНОВЛЕНИЕ ПО: В ЖДУЩЕМ РЕЖИМЕ..." : "ОБНОВИТЬ ПРОШИВКУ (OTA)",
+      style: TextStyle(color: _otaMode ? Colors.blue : Colors.redAccent, fontWeight: FontWeight.bold),
+      ),
+      ),
+      ),
+      ],
+      ),
+      ),
+    );
+  }
 }
