@@ -38,6 +38,7 @@ static const char *TAG = "greenhouse_cam";
 
 #define TARGET_PERIOD_SEC   600
 #define MOUNT_POINT         "/sdcard"
+#define FILE_PATTERN		"%s/photos/%05d.raw"
 
 // Пины Freenove V1695
 #define XCLK_GPIO_NUM     15
@@ -69,7 +70,7 @@ static sdmmc_card_t* global_card_handle = NULL;
 static uint32_t hardware_errors_mask = 0; 
 RTC_DATA_ATTR static int mode = 0;
 RTC_DATA_ATTR static uint64_t time_to_sleep_enter = 0;
-
+RTC_DATA_ATTR static int rtc_saved_file_index = 0; // Текущий индекс файла
 
 static camera_config_t camera_config = {
     .pin_pwdn = -1, 
@@ -204,15 +205,25 @@ camera_fb_t* take_photo(void) {
     return fb_real;    
 }
 
-bool save_photo_to_sd(camera_fb_t *fb, int index) {
-    if (!fb || fb->len == 0) return false;
-    char file_path[32];
-    snprintf(file_path, sizeof(file_path), "%s/%05d.raw", MOUNT_POINT, index);
+bool save_photo_to_sd(camera_fb_t *fb, int index) 
+{
+    // Принудительно создаем папку. Если она уже есть, операционная система просто пропустит этот шаг
+    mkdir("/sdcard/photos", 0755); 
+
+    char file_path[64];
+    snprintf(file_path, sizeof(file_path), FILE_PATTERN, MOUNT_POINT, index);
+    
+    ESP_LOGI("SD_WRITE", "Запись файла: %s", file_path);
     FILE *f = fopen(file_path, "wb");
-    if (f == NULL) return false;
-    fwrite(fb->buf, 1, fb->len, f);
+    if (f == NULL) {
+        ESP_LOGE("SD_WRITE", "[-] Ошибка создания файла! Проверьте формат карты.");
+        return false;
+    }
+    
+    size_t written = fwrite(fb->buf, 1, fb->len, f);
     fclose(f);
-    return true;
+    
+    return (written == fb->len);
 }
 
 // --- БЛОК 2: СЕТЕВОЙ СТЭК ---
@@ -323,22 +334,39 @@ bool send_file(uint8_t *buf, size_t len, uint32_t index) {
 }
 
 // Функция динамического поиска последнего индекса на SD-карте
-int get_last_file_index_from_sd(void) 
-{
+int get_last_file_index_from_sd(void) {
+    // Если в RTC-памяти уже лежит сохраненный индекс больше нуля,
+    // значит мы проснулись по таймеру или кнопке. Просто возвращаем его без сканирования флешки!
+    if (rtc_saved_file_index > 0) {
+        ESP_LOGI("SD_INDEX", "[RTC-RAM] Индекс успешно взят из памяти процессора: %d", rtc_saved_file_index);
+        return rtc_saved_file_index;
+    }
+
+    // Если там оказался 0 (самый первый старт системы при подаче питания) — 
+    // запускаем ваш проверенный, честный построчный сканер stat, но ищем уже внутри папки photos!
+    ESP_LOGW("SD_INDEX", "[!] RTC-RAM пуста. Запускаем однократное аппаратное сканирование папки photos...");
+    
     int index = 1;
     char path[64];
     struct stat st;
     
-    // Перебираем имена, пока stat находит файл
     while (index < 99999) {
-        snprintf(path, sizeof(path), "%s/%05d.raw", MOUNT_POINT, index);
+        // Ищем файлы строго внутри нашей новой выделенной папки photos
+        snprintf(path, sizeof(path), "%s/photos/%05d.raw", MOUNT_POINT, index);
         if (stat(path, &st) != 0) {
             break; // Файл не найден, значит предыдущий индекс был последним
         }
         index++;
     }
     
-    return index - 1;
+    // Вычисляем финальный индекс
+    int final_index = index - 1;
+    
+    // Запоминаем его в RTC-RAM, чтобы больше никогда сюда не заходить!
+    rtc_saved_file_index = final_index;
+    
+    ESP_LOGW("SD_INDEX", "[SUCCESS] Сканирование завершено. Последний файл на флешке: %d. Индекс сохранен в RTC!", final_index);
+    return final_index;
 }
 
 // --- БЛОК 4: ИДЕАЛЬНЫЙ СУПЕР-ЛИНЕЙНЫЙ КОНВЕЙЕР ---
@@ -380,11 +408,10 @@ void app_main(void) {
 			boot_count = 1;
 		} else {
 			mode = 2; // Hold button mode (Setting mode). Этот mode для настройки камеры. Только фото и отправка  
-			printf("*");
 			while (!gpio_get_level(0)) {vTaskDelay(pdMS_TO_TICKS(100));}
 		}
 	}
-	mode = 3; //Greenhouse mode (Photo, saving and download mode). Это режим для теплицы. Кнопка игнорируется. Включается только так.
+	//mode = 3; //Greenhouse mode (Photo, saving and download mode). Это режим для теплицы. Кнопка игнорируется. Включается только так.
 	ESP_LOGW(TAG, "The mode is %d", mode);
 
 	if (mode == 0 || mode == 1 || mode == 3) { 
@@ -411,9 +438,11 @@ void app_main(void) {
 	        
 	        // Пишем на карту, только если кадр не пустой(маска ошибок не содержит 0x02) и только если обычный mode(0)
 	        if (!(hardware_errors_mask & 0x02) && (mode == 0) && fb && fb->buf && fb->len > 0) {
-	            if (!save_photo_to_sd(fb, boot_count)) {
-	                hardware_errors_mask |= 0x04;
-	            }
+	            if (save_photo_to_sd(fb, boot_count)) {
+					rtc_saved_file_index = boot_count + 1; 
+	            } else {
+					hardware_errors_mask |= 0x04;
+				}
 	        }
 	    } else {
 	        hardware_errors_mask |= 0x04; 
@@ -454,7 +483,7 @@ void app_main(void) {
 
 					if (sd_ok && !(hardware_errors_mask & 0x04)) {
 						char file_path[32]; struct stat st;
-						snprintf(file_path, sizeof(file_path), "%s/%05d.raw", MOUNT_POINT, i);
+						snprintf(file_path, sizeof(file_path), FILE_PATTERN, MOUNT_POINT, i);
 
 						if (stat(file_path, &st) == 0) {
 							file_size = st.st_size;
