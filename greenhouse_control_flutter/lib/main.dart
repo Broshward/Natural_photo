@@ -36,6 +36,8 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
   String _statusText = "Статус: Ожидание теплицы...";
   String _batteryText = "Батарея: -- V (--%)";
   String _queueText = "[OK] Железо платы исправно";
+  int _totalFramesOnBoard = 0; // Всего кадров в теплице
+  int _localFramesCount = 0;   // Сколько уже скачано на телефон
   
   bool _formatRequested = false;
   bool _otaMode = false;
@@ -118,12 +120,13 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
   }
 
   // ЛИНЕЙНЫЙ ДИСПЕТЧЕР С ПОШАГОВЫМ ОЖИДАНИЕМ БУФЕРА
-  void _handleEsp32Connection(Socket client) async {
+   void _handleEsp32Connection(Socket client) async {
     client.timeout(const Duration(seconds: 15)); 
     final iterator = StreamIterator<Uint8List>(client);
     List<int> currentBuffer = [];
 
     try {
+      // Шаг 1: Сначала всегда читаем стандартные 16 байт заголовка
       while (currentBuffer.length < 16) {
         if (!await iterator.moveNext()) break;
         currentBuffer.addAll(iterator.current);
@@ -143,8 +146,24 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
       int batPct = (((batV - 3.5) / (4.2 - 3.5)) * 100).clamp(0, 100).toInt();
       double freeGb = freeSpaceMb / 1024.0;
 
-      // СЦЕНАРИЙ А: Холостой пинг
+      // =======================================================================
+      // СЦЕНАРИЙ А: Холостой пинг (ESP32 прислала нам 20 байт)
+      // =======================================================================
       if (imgSize == 0) {
+        // ДОЧИТЫВАЕМ ЕЩЕ 4 БАЙТА (пятый элемент header[4] из ESP32)
+        while (currentBuffer.length < 20) {
+          if (!await iterator.moveNext()) break;
+          currentBuffer.addAll(iterator.current);
+        }
+
+        if (currentBuffer.length < 20) {
+          await client.close(); iterator.cancel(); return;
+        }
+
+        // Парсим наше новое 5-е поле (смещение 16 байт от начала заголовка)
+        final extendedBd = ByteData.sublistView(Uint8List.fromList(currentBuffer.sublist(16, 20)));
+        int lastSavedFrameIndex = extendedBd.getUint32(0, Endian.little);
+
         int errorMask = imgIndex; 
         String hardwareLog = "[OK] Железо платы исправно";
         if (errorMask > 0) {
@@ -156,30 +175,52 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
         }
 
         String storageStr = freeSpaceMb > 0 ? "Карта: ${freeGb.toStringAsFixed(2)} ГБ свободно" : "Карта: Неисправна или Отформатирована";
-        setState(() {
-          _queueText = hardwareLog; 
-          _batteryText = batMv > 0 ? "Батарея: ${batV.toStringAsFixed(2)} V ($batPct%)" : "Батарея: USB";
-          _statusText = storageStr;
-        });
+        
+        // Переменная для вывода информации о количестве кадров на экране смартфона
+        String frameCounterStr = "Всего кадров в теплице: $lastSavedFrameIndex";
+
+        // Узнаем, сколько у нас уже скачано локально
+int maxSavedIdx = await get_max_saved_index();
+
+setState(() {
+  _queueText = hardwareLog; 
+  _batteryText = batMv > 0 ? "Батарея: ${batV.toStringAsFixed(2)} V ($batPct%)" : "Батарея: USB";
+  _statusText = storageStr;
+  
+  // Сохраняем значения в глобальные переменные состояния класса!
+  _totalFramesOnBoard = lastSavedFrameIndex;
+  _localFramesCount = maxSavedIdx; 
+});
 
         if (_otaMode) {
-          final otaFile = File('/storage/emulated/0/Download/firmware.bin');
-          if (otaFile.existsSync()) {
-            int otaSize = otaFile.lengthSync();
-            client.add(Uint8List.fromList("OTA:$otaSize".codeUnits));
-            await client.flush(); 
-            
-            currentBuffer = currentBuffer.sublist(16);
-            while (!currentBuffer.contains(82) || !currentBuffer.contains(89)) { 
-              if (!await iterator.moveNext()) break;
-              currentBuffer.addAll(iterator.current);
+          // 1. Получаем путь к системной папке приложения динамически
+          final extDir = await getExternalStorageDirectory();
+          
+          if (extDir != null) {
+            // 2. Формируем правильный путь к файлу firmware.bin в этой папке
+            final otaFile = File('${extDir.path}/firmware.bin');
+
+            if (otaFile.existsSync()) {
+              int otaSize = otaFile.lengthSync();
+              client.add(Uint8List.fromList("OTA:$otaSize".codeUnits));
+              await client.flush(); 
+              
+              currentBuffer = currentBuffer.sublist(20);
+              while (!currentBuffer.contains(82) || !currentBuffer.contains(89)) { 
+                if (!await iterator.moveNext()) break;
+                currentBuffer.addAll(iterator.current);
+              }
+              setState(() { _statusText = "Передача прошивки по воздуху..."; });
+              final binaryBytes = otaFile.readAsBytesSync();
+              client.add(binaryBytes);
+              await client.flush(); 
+              setState(() { _otaMode = false; _statusText = "Прошивка успешно загружена!"; });
+            } else {
+              // Маленький бонус: если режима OTA включен, но файла нет, выводим подсказку
+              setState(() { _statusText = "Ошибка: Файл firmware.bin не найден в папке приложения!"; _otaMode = false; });
             }
-            setState(() { _statusText = "Передача прошивки по воздуху..."; });
-            final binaryBytes = otaFile.readAsBytesSync();
-            client.add(binaryBytes);
-            await client.flush(); 
-            setState(() { _otaMode = false; _statusText = "Прошивка успешно загружена!"; });
           }
+          
           await client.close(); iterator.cancel(); return;
         } else if (_formatRequested) {
           client.add(Uint8List.fromList("FORMAT_SD\n".codeUnits)); await client.flush();
@@ -194,8 +235,11 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
         }
       }
 
-      // СЦЕНАРИЙ Б: Восстановленный прием и декодирование YUV422 от OV3660
+      // =======================================================================
+      // СЦЕНАРИЙ Б: Прием файла (ESP32 прислала строго 16 байт заголовка)
+      // =======================================================================
       if (imgSize > 0) {
+        // Отрезаем ровно 16 байт заголовка, всё остальное — это байты нашей картинки
         List<int> imagePayload = currentBuffer.sublist(16);
         while (imagePayload.length < imgSize) {
           if (!await iterator.moveNext()) break;
@@ -204,9 +248,7 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
 
         final rawYuvBytes = Uint8List.fromList(imagePayload.sublist(0, imgSize));
         
-        // ВЫЗЫВАЕМ НАШ ИСПРАВЛЕННЫЙ КОНВЕРТЕР ЦВЕТОВ ОV3660
         final convertedJpeg = convertYuv422ToJpeg(rawYuvBytes, 1280, 1024);
-        //final convertedJpeg = convertYuv422ToJpeg(rawYuvBytes, 1024, 768);
 
         try {
           final extDir = await getExternalStorageDirectory();
@@ -220,10 +262,16 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
           }
         } catch (e) { print("Ошибка записи: $e"); }
 
+        // Считаем прогресс: текущий индекс кадра делим на общее число сохраненных кадров
+        // Здесь вы можете использовать информацию для обновления UI-прогрессбара
         setState(() {
           _jpegBytes = convertedJpeg;
-          _statusText = "Успешно зафиксирован кадр №${imgIndex.toString().padLeft(5, '0')}";
+          _statusText = "Скачан кадр №${imgIndex.toString().padLeft(5, '0')}";
+          
+          // Ме мега-удобно инкрементируем наш счетчик скачанных файлов прямо на лету!
+          _localFramesCount = imgIndex; 
         });
+        
 
         final ack = ByteData(4)..setInt32(0, imgIndex, Endian.little);
         client.add(ack.buffer.asUint8List());
@@ -308,56 +356,91 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
 
 @override
 Widget build(BuildContext context) {
+  // Вычисляем, сколько кадров осталось скачать
+  int framesLeft = _totalFramesOnBoard - _localFramesCount;
+  if (framesLeft < 0) framesLeft = 0;
+
   return Scaffold(
     appBar: AppBar(title: const Text('Greenhouse Control Пульт')),
     body: Padding(
       padding: const EdgeInsets.all(12.0),
       child: Column(
-      children: [
-      Expanded(
-      child: Container(
-      width: double.infinity,
-      decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(8)),
-      child: _jpegBytes != null
-      ? Image.memory(_jpegBytes!, fit: BoxFit.contain)
-      : const Center(child: Text("Ожидание теплицы...", style: TextStyle(color: Colors.grey))),
+        children: [
+          Expanded(
+            child: Container(
+              width: double.infinity,
+              decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(8)),
+              child: _jpegBytes != null
+                  ? Image.memory(_jpegBytes!, fit: BoxFit.contain)
+                  : const Center(child: Text("Ожидание теплицы...", style: TextStyle(color: Colors.grey))),
+            ),
+          ),
+          const SizedBox(height: 15),
+          Text(_statusText, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold), textAlign: TextAlign.center),
+          const SizedBox(height: 5),
+          Text(_queueText, style: TextStyle(fontSize: 15, color: _queueText.contains("Авария") ? Colors.redAccent : Colors.white70, fontWeight: _queueText.contains("Аvaрия") ? FontWeight.bold : FontWeight.normal)),
+          const SizedBox(height: 5),
+          Text(_batteryText, style: const TextStyle(fontSize: 15, color: Colors.greenAccent)),
+          
+          // =======================================================================
+          // НАШ НОВЫЙ БЛОК: ИНДИКАТОР ОЧЕРЕДИ СКАЧИВАНИЯ КАДРОВ
+          // =======================================================================
+          const SizedBox(height: 10),
+          Container(
+            padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+            decoration: BoxDecoration(
+              color: framesLeft > 0 ? Colors.blue.withOpacity(0.1) : Colors.green.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  framesLeft > 0 ? "Осталось скачать: $framesLeft кадров" : "Синхронизировано",
+                  style: TextStyle(
+                    fontSize: 14, 
+                    fontWeight: FontWeight.bold, 
+                    color: framesLeft > 0 ? Colors.blue : Colors.greenAccent
+                  ),
+                ),
+                Text(
+                  "$_localFramesCount из $_totalFramesOnBoard",
+                  style: const TextStyle(fontSize: 14, color: Colors.grey),
+                ),
+              ],
+            ),
+          ),
+          // =======================================================================
+
+          const SizedBox(height: 15),
+          SizedBox(
+            width: double.infinity,
+            height: 48,
+            child: ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.grey),
+              onPressed: _showFormatDialog,
+              child: const Text("ОЧИСТИТЬ ФЛЭШКУ НА ПЛАТЕ", style: TextStyle(fontSize: 14, color: Colors.white)),
+            ),
+          ),
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            height: 44,
+            child: OutlinedButton(
+              style: OutlinedButton.styleFrom(
+                side: BorderSide(color: _otaMode ? Colors.blue : Colors.redAccent),
+                backgroundColor: _otaMode ? Colors.blue.withOpacity(0.1) : Colors.transparent,
+              ),
+              onPressed: _showOtaDialog,
+              child: Text(
+                _otaMode ? "ОБНОВЛЕНИЕ ПО: В ЖДУЩЕМ РЕЖИМЕ..." : "ОБНОВИТЬ ПРОШИВКУ (OTA)",
+                style: TextStyle(color: _otaMode ? Colors.blue : Colors.redAccent, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+        ],
       ),
-      ),
-      const SizedBox(height: 15),
-      Text(_statusText, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold), textAlign: TextAlign.center),
-      const SizedBox(height: 5),
-      Text(_queueText, style: TextStyle(fontSize: 15, color: _queueText.contains("Авария") ? Colors.redAccent : Colors.white70, fontWeight: _queueText.contains("Авария") ? FontWeight.bold : FontWeight.normal)),
-      const SizedBox(height: 5),
-      Text(_batteryText, style: const TextStyle(fontSize: 15, color: Colors.greenAccent)),
-      const SizedBox(height: 15),
-      SizedBox(
-      width: double.infinity,
-      height: 48,
-      child: ElevatedButton(
-      style: ElevatedButton.styleFrom(backgroundColor: Colors.grey),
-      onPressed: _showFormatDialog,
-      child: const Text("ОЧИСТИТЬ ФЛЭШКУ НА ПЛАТЕ", style: TextStyle(fontSize: 14, color: Colors.white)),
-      ),
-      ),
-      const SizedBox(height: 10),
-      SizedBox(
-      width: double.infinity,
-      height: 44,
-      child: OutlinedButton(
-      style: OutlinedButton.styleFrom(
-      side: BorderSide(color: _otaMode ? Colors.blue : Colors.redAccent),
-      backgroundColor: _otaMode ? Colors.blue.withOpacity(0.1) : Colors.transparent,
-      ),
-      onPressed: _showOtaDialog,
-      child: Text(
-      _otaMode ? "ОБНОВЛЕНИЕ ПО: В ЖДУЩЕМ РЕЖИМЕ..." : "ОБНОВИТЬ ПРОШИВКУ (OTA)",
-      style: TextStyle(color: _otaMode ? Colors.blue : Colors.redAccent, fontWeight: FontWeight.bold),
-      ),
-      ),
-      ),
-      ],
-      ),
-      ),
-    );
-  }
+    ),
+  );
+}
 }

@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include <sys/time.h>
 
 // Железо и ФС
 #include "esp_camera.h"
@@ -19,6 +20,7 @@
 #include "ff.h"
 #include "driver/sdspi_host.h" // ВКЛЮЧАЕМ ДРАЙВЕР SPI ДЛЯ КАРТЫ ПАМЯТИ
 #include "driver/spi_common.h"
+#include "driver/rtc_io.h"
 
 // Сеть и OTA
 #include "esp_wifi.h"
@@ -147,24 +149,6 @@ void shutdown_greenhouse_camera(void) {
     write_sensor_reg(0x3008, 0x40); 
 }
 
-void audit_ov3660_pll(void) {
-    ESP_LOGW("pll_debug", "=== ОПРОС РЕГИСТРОВ PLL OV3660 ===");
-    
-    uint8_t r_303a = read_sensor_reg(0x303A);
-    uint8_t r_303b = read_sensor_reg(0x303B);
-    uint8_t r_303c = read_sensor_reg(0x303C);
-    uint8_t r_303d = read_sensor_reg(0x303D);
-    uint8_t r_3008 = read_sensor_reg(0x3008);
-
-    ESP_LOGI("pll_debug", "Регистр 0x303A (PLL Bypass): 0x%02X [Bit 7: %d]", r_303a, (r_303a >> 7) & 1);
-    ESP_LOGI("pll_debug", "Регистр 0x303B (PLL Multiplier): 0x%02X [Множитель: %d]", r_303b, r_303b & 0x1F);
-    ESP_LOGI("pll_debug", "Регистр 0x303C (Sys Divider): 0x%02X [Делитель: %d]", r_303c, r_303c & 0x0F);
-    ESP_LOGI("pll_debug", "Регистр 0x303D (Pre-divider): 0x%02X", r_303d);
-    ESP_LOGI("pll_debug", "Регистр 0x3008 (Текущий режим питания): 0x%02X", r_3008);
-    
-    ESP_LOGW("pll_debug", "=================================");
-}
-
 camera_fb_t* take_photo(void) {
     if (esp_camera_init(&camera_config) != ESP_OK) {
         hardware_errors_mask |= 0x01;
@@ -175,16 +159,7 @@ camera_fb_t* take_photo(void) {
 //	ESP_LOGI(TAG, "Compression enable %u", read_sensor_reg(0x3821));
 //	ESP_LOGI(TAG, "Compression MODE %u", read_sensor_reg(0x4713));
 //	ESP_LOGI(TAG, "SCCB_ID %u", read_sensor_reg(0x4713));
-//    vTaskDelay(pdMS_TO_TICKS(1000)); // Даем камере перестроиться на черепаший шаг
-//    audit_ov3660_pll();
 //
-//    ESP_LOGW("main_cam", "[!] Включаем PLL Bypass по фэншую. Замедление PCLK...");
-//
-//    // 2. ОТКЛЮЧАЕМ PLL МАТРИЦЫ (ВКЛЮЧАЕМ BYPASS) ИЗ ВАШЕЙ ТАБЛИЦЫ!
-//    // Запись бита 7 в 1 полностью отключает умножитель. 
-//    // Частота пикселей PCLK станет равна нашим чистым, медленным 10 МГц!
-//    write_sensor_reg(0x303A, 0x80); 
-//    
 //    vTaskDelay(pdMS_TO_TICKS(200)); // Даем стабилизироваться кадрам
 
     // Прогреваем матрицу
@@ -228,7 +203,8 @@ bool save_photo_to_sd(camera_fb_t *fb, int index)
 
 // --- БЛОК 2: СЕТЕВОЙ СТЭК ---
 
-static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) 
+{
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -238,7 +214,8 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     }
 }
 
-bool wifi_init_sta(void) {
+bool wifi_init_sta(void) 
+{
     s_wifi_event_group = xEventGroupCreate();
     esp_netif_init();
     esp_event_loop_create_default();
@@ -255,7 +232,8 @@ bool wifi_init_sta(void) {
     return (bits & WIFI_CONNECTED_BIT) ? true : false;
 }
 
-int create_connected_socket(void) {
+int create_connected_socket(void) 
+{
     struct sockaddr_in dest_addr = { .sin_addr.s_addr = inet_addr(SERVER_IP), .sin_family = AF_INET, .sin_port = htons(SERVER_PORT) };
     int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
     if (sock < 0) return -1;
@@ -269,7 +247,8 @@ int create_connected_socket(void) {
 // --- БЛОК 3: РАЗДЕЛЬНЫЙ СЕТЕВОЙ ОБМЕН С МАСКОЙ ОШИБОК ---
 
 // Раздельная функция 1: Отправка информации (Вшиваем маску аппаратных ошибок hardware_errors_mask)
-bool send_info(uint32_t index) {
+bool send_info() 
+{
     int sock = create_connected_socket();
     if (sock < 0) return false;
 
@@ -277,7 +256,7 @@ bool send_info(uint32_t index) {
     uint32_t free_mb = global_card_handle ? get_sd_free_space_mb() : 0;
 
     // Пункт №3: Передаем hardware_errors_mask вместо индекса кадра в холостом пинге!
-    uint32_t header[4] = { hardware_errors_mask, 0, bat_mv, free_mb };
+    uint32_t header[5] = { hardware_errors_mask, 0, bat_mv, free_mb, rtc_saved_file_index };
     if (send(sock, header, sizeof(header), 0) < 0) { close(sock); return false; }
 
     char rx_buf[32] = {0};
@@ -305,6 +284,7 @@ bool send_info(uint32_t index) {
                 }
             }
         } else if (strncmp(rx_buf, "FORMAT_SD", 9) == 0) {
+			ESP_LOGW(TAG, "FORMAT SD-карты...");
             format_requested = true;
         } else if (rx_len == 4) {
             int32_t rx_index = -1; memcpy(&rx_index, rx_buf, 4); server_requested_index = rx_index;
@@ -371,14 +351,13 @@ int get_last_file_index_from_sd(void) {
 
 // --- БЛОК 4: ИДЕАЛЬНЫЙ СУПЕР-ЛИНЕЙНЫЙ КОНВЕЙЕР ---
 void app_main(void) {
-//	uint64_t actual_sleep_time_us = esp_deep_sleep_get_actual_time_to_sleep();
     uint64_t session_start_us = esp_timer_get_time();
 	ESP_LOGW(TAG, "Begin time %lu", session_start_us);
 
     hardware_errors_mask = 0; 
 
-    gpio_config_t io_conf = { .pin_bit_mask = (1ULL << 48), .mode = GPIO_MODE_OUTPUT, .pull_up_en = 0, .pull_down_en = 1 };
-    gpio_config(&io_conf); gpio_set_level(48, 0);
+    gpio_config_t o_conf = { .pin_bit_mask = (1ULL << 48), .mode = GPIO_MODE_OUTPUT, .pull_up_en = 0, .pull_down_en = 1 };
+    gpio_config(&o_conf); gpio_set_level(48, 0);
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -411,11 +390,11 @@ void app_main(void) {
 			while (!gpio_get_level(0)) {vTaskDelay(pdMS_TO_TICKS(100));}
 		}
 	}
-	//mode = 3; //Greenhouse mode (Photo, saving and download mode). Это режим для теплицы. Кнопка игнорируется. Включается только так.
+	mode = 3; //Greenhouse mode (Photo, saving and download mode). Это режим для теплицы. Кнопка игнорируется. Включается только так.
 	ESP_LOGW(TAG, "The mode is %d", mode);
 
+	// 1. Снимаем плановый кадр во временный буфер
 	if (mode == 0 || mode == 1 || mode == 3) { 
-		// 1. Снимаем плановый кадр во временный буфер
 		fb = take_photo();
 		// ПРИНУДИТЕЛЬНО ТУШИМ КАМЕРУ! 
 		shutdown_greenhouse_camera();
@@ -434,12 +413,12 @@ void app_main(void) {
 		}
 	    if (sd_ok) {
 	        boot_count = get_last_file_index_from_sd() + 1;
-			ESP_LOGI(TAG, "[+] Last file in the card %d", boot_count);
+			ESP_LOGI(TAG, "[+] Last file in the card %d", boot_count-1);
 	        
-	        // Пишем на карту, только если кадр не пустой(маска ошибок не содержит 0x02) и только если обычный mode(0)
-	        if (!(hardware_errors_mask & 0x02) && (mode == 0) && fb && fb->buf && fb->len > 0) {
+	        // Пишем на карту, только если кадр не пустой и маска ошибок не содержит 0x02
+	        if (!(hardware_errors_mask & 0x02) && fb && fb->buf && fb->len > 0) {
 	            if (save_photo_to_sd(fb, boot_count)) {
-					rtc_saved_file_index = boot_count + 1; 
+					rtc_saved_file_index = boot_count; 
 	            } else {
 					hardware_errors_mask |= 0x04;
 				}
@@ -451,14 +430,14 @@ void app_main(void) {
 
 	if (mode_prev != 0) // Это может быть, если выгрузка файлов прервалась таймером
 		mode = mode_prev;
-    // 3. Сетевой блок (Запускается только если нажатие на кнопку(не таймер))
+    // 3. Сетевой блок (Запускается только если нажатие на кнопку(не таймер) или теплица(mode=3))
 	//if (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER) {
 	if(mode == 1 || mode == 2 || mode == 3) {
 		if (wifi_init_sta()) {
 			ESP_LOGI(TAG, "Wi-Fi ОК. Передача лога ошибок: 0x%X", hardware_errors_mask);
 
 			// Сетевой диалог А: Холостой пинг синхронизации
-			send_info(boot_count);
+			send_info();
 
 			if (server_requested_index != -1) {
 				last_sent_index = server_requested_index;
@@ -515,15 +494,18 @@ void app_main(void) {
 	}
 
 	//Буфер камеры больше не нужен
-	esp_camera_fb_return(fb); 
-    esp_camera_deinit(); 
-	
+	if (mode == 0 || mode == 1 || mode == 3)
+	{
+		esp_camera_fb_return(fb); 
+		esp_camera_deinit(); 
+	}	
     // --- ФИНАЛЬНЫЙ СИНХРОННЫЙ УХОД В СОН (БЕЗ МЕТОК) ---
 
     if (sd_ok && global_card_handle) {
         if (format_requested) { 
             format_requested = false; 
             format_sd_card(); 
+			rtc_saved_file_index = 0;
         } else { 
             esp_vfs_fat_sdcard_unmount(MOUNT_POINT, global_card_handle); 
         }
@@ -531,6 +513,12 @@ void app_main(void) {
 
     gpio_hold_en(GPIO_NUM_48); 
     esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+
+    // Включаем внутреннюю подтяжку pull-up через RTC-модуль, чтобы она работала во сне
+    rtc_gpio_init(0);
+    rtc_gpio_set_direction(0, RTC_GPIO_MODE_INPUT_ONLY);
+    rtc_gpio_pullup_en(0);
+    rtc_gpio_pulldown_dis(0);
 
     int elapsed_sec = (int)((esp_timer_get_time() - session_start_us) / 1000000ULL);
     int sleep_time_sec = TARGET_PERIOD_SEC - elapsed_sec;
