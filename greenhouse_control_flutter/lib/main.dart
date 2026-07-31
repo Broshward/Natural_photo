@@ -248,6 +248,11 @@ setState(() {
 
         final rawYuvBytes = Uint8List.fromList(imagePayload.sublist(0, imgSize));
         
+        // --- НАШ НОВЫЙ БЛОК ИЗМЕРЕНИЯ ОСВЕЩЕННОСТИ ---
+        int currentBrightness = _calculateYuv422Brightness(rawYuvBytes);
+        // Выводим жирную и заметную строчку в консоль Flutter (VS Code / Android Studio)
+        print("☀️ [GREENHOUSE CAMERA] Кадр №$imgIndex -> СРЕДНЯЯ ЯРКОСТЬ: $currentBrightness");
+
         final convertedJpeg = convertYuv422ToJpeg(rawYuvBytes, 1280, 1024);
 
         try {
@@ -283,6 +288,23 @@ setState(() {
       try { await client.close(); } catch (_) {}
       iterator.cancel();
     }
+  }
+
+  int _calculateYuv422Brightness(Uint8List yuvBytes) {
+    if (yuvBytes.isEmpty) return 0;
+
+    int totalBrightness = 0;
+    int yPixelCount = 0;
+
+    // В YUV422 байты идут: Y0, U0, Y1, V0. 
+    // Нам нужен каждый второй байт (индексы 0, 2, 4, 6...), где лежит яркость Y.
+    for (int i = 0; i < yuvBytes.length; i += 2) {
+      totalBrightness += yuvBytes[i];
+      yPixelCount++;
+    }
+
+    if (yPixelCount == 0) return 0;
+    return totalBrightness ~/ yPixelCount; // Целочисленное деление
   }
 
   void _showFormatDialog() {

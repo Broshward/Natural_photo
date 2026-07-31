@@ -42,6 +42,10 @@ static const char *TAG = "greenhouse_cam";
 #define MOUNT_POINT         "/sdcard"
 #define FILE_PATTERN		"%s/photos/%05d.raw"
 
+#define DARK_THRESHOLD 70  // Порог темноты (0 - глубокая ночь, 255 - белый лист)
+                           // Экспериментально для теплицы обычно подходит от 30 до 45
+
+
 // Пины Freenove V1695
 #define XCLK_GPIO_NUM     15
 #define SIOD_GPIO_NUM     4  
@@ -349,6 +353,34 @@ int get_last_file_index_from_sd(void) {
     return final_index;
 }
 
+//Функция анализа освещённости кадра
+bool is_frame_too_dark(uint8_t *yuv_buf, size_t len) {
+    uint64_t total_brightness = 0;
+    size_t y_pixel_count = 0;
+
+    // Шаг по буферу: YUV422 хранит байты как Y0, U0, Y1, V0
+    // Нам нужен каждый 2-й байт, начиная с индекса 0 (это Y0, Y1, Y2...)
+    for (size_t i = 0; i < len; i += 2) {
+        total_brightness += yuv_buf[i];
+        y_pixel_count++;
+    }
+
+    if (y_pixel_count == 0) return true; // На всякий случай
+
+    // Считаем среднюю яркость кадра
+    uint8_t average_brightness = (uint8_t)(total_brightness / y_pixel_count);
+
+    // Логируем в консоль для подбора идеального порога
+    ESP_LOGI("CAM_BRIGHT", "Средняя яркость кадра: %u (Порог: %d)", average_brightness, DARK_THRESHOLD);
+
+    // Если средняя яркость меньше порога — кадр слишком темный
+    if (average_brightness < DARK_THRESHOLD) {
+        return true; 
+    }
+
+    return false; // Кадр нормальный, можно сохранять
+}
+
 // --- БЛОК 4: ИДЕАЛЬНЫЙ СУПЕР-ЛИНЕЙНЫЙ КОНВЕЙЕР ---
 void app_main(void) {
     uint64_t session_start_us = esp_timer_get_time();
@@ -415,8 +447,8 @@ void app_main(void) {
 	        boot_count = get_last_file_index_from_sd() + 1;
 			ESP_LOGI(TAG, "[+] Last file in the card %d", boot_count-1);
 	        
-	        // Пишем на карту, только если кадр не пустой и маска ошибок не содержит 0x02
-	        if (!(hardware_errors_mask & 0x02) && fb && fb->buf && fb->len > 0) {
+	        // Пишем на карту, только если кадр не пустой и маска ошибок не содержит 0x02 и если кадр не слишком тёмный!!!
+	        if (!(hardware_errors_mask & 0x02) && fb && fb->buf && fb->len > 0 && !is_frame_too_dark(fb->buf, fb->len)) {
 	            if (save_photo_to_sd(fb, boot_count)) {
 					rtc_saved_file_index = boot_count; 
 	            } else {
