@@ -2,6 +2,8 @@
 #include <string.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
+#include <dirent.h> // Нужен для работы с каталогами
+#include <string.h>
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_sleep.h"
@@ -40,7 +42,7 @@ static const char *TAG = "greenhouse_cam";
 
 #define TARGET_PERIOD_SEC   600
 #define MOUNT_POINT         "/sdcard"
-#define FILE_PATTERN		"%s/photos/%05d.raw"
+#define FILE_PATTERN		"%s/photos/%04d%02d%02d_%02d%02d%02d_%05d.raw"
 
 #define DARK_THRESHOLD 70  // Порог темноты (0 - глубокая ночь, 255 - белый лист)
                            // Экспериментально для теплицы обычно подходит от 30 до 45
@@ -184,15 +186,72 @@ camera_fb_t* take_photo(void) {
     return fb_real;    
 }
 
+bool find_file_by_index(int index, char *out_path, size_t max_len) 
+{
+    DIR *dir = opendir("/sdcard/photos");
+    if (!dir) {
+        ESP_LOGE("SD_READ", "[-] Не удалось открыть каталог /photos");
+        return false;
+    }
+
+    struct dirent *entry;
+    char suffix[16];
+    // Формируем уникальный хвост файла, например: "_00421.raw"
+    snprintf(suffix, sizeof(suffix), "_%05d.raw", index);
+
+    bool found = false;
+
+    // Сканируем файлы в папке
+    while ((entry = readdir(dir)) != NULL) {
+        size_t name_len = strlen(entry->d_name);
+        size_t suffix_len = strlen(suffix);
+
+        // Если имя файла длиннее суффикса, проверяем совпадение с конца строки
+        if (name_len >= suffix_len) {
+            const char *end_of_name = entry->d_name + (name_len - suffix_len);
+            if (strcmp(end_of_name, suffix) == 0) {
+                // Файл найден! Записываем полный путь в буфер ответа
+                snprintf(out_path, max_len, "/sdcard/photos/%s", entry->d_name);
+                found = true;
+                break;
+            }
+        }
+    }
+    closedir(dir);
+
+    if (found) {
+        ESP_LOGI("SD_READ", "[+] Файл для индекса %d успешно найден: %s", index, out_path);
+    } else {
+        ESP_LOGW("SD_READ", "[-] Файл с индексом %d (_%05d.raw) не найден на карте", index, index);
+    }
+
+    return found;
+}
+
 bool save_photo_to_sd(camera_fb_t *fb, int index) 
 {
-    // Принудительно создаем папку. Если она уже есть, операционная система просто пропустит этот шаг
+    // Принудительно создаем папку. Если она есть, шаг просто пропустится
     mkdir("/sdcard/photos", 0755); 
 
+    // 1. Получаем текущее время из встроенного RTC-счетчика ESP32-S3
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
     char file_path[64];
-    snprintf(file_path, sizeof(file_path), FILE_PATTERN, MOUNT_POINT, index);
+    // 2. Собираем имя по новому паттерну: путь, дата, время, индекс
+    snprintf(file_path, sizeof(file_path), FILE_PATTERN, 
+             MOUNT_POINT,
+             (timeinfo.tm_year + 1900), 
+             (timeinfo.tm_mon + 1), 
+             timeinfo.tm_mday,
+             timeinfo.tm_hour, 
+             timeinfo.tm_min, 
+             timeinfo.tm_sec,
+             index);
     
-    ESP_LOGI("SD_WRITE", "Запись файла: %s", file_path);
+    ESP_LOGI("SD_WRITE", "Запись кадра: %s", file_path);
     FILE *f = fopen(file_path, "wb");
     if (f == NULL) {
         ESP_LOGE("SD_WRITE", "[-] Ошибка создания файла! Проверьте формат карты.");
@@ -318,39 +377,40 @@ bool send_file(uint8_t *buf, size_t len, uint32_t index) {
 }
 
 // Функция динамического поиска последнего индекса на SD-карте
-int get_last_file_index_from_sd(void) {
-    // Если в RTC-памяти уже лежит сохраненный индекс больше нуля,
-    // значит мы проснулись по таймеру или кнопке. Просто возвращаем его без сканирования флешки!
+int get_last_file_index_from_sd(void) 
+{
     if (rtc_saved_file_index > 0) {
         ESP_LOGI("SD_INDEX", "[RTC-RAM] Индекс успешно взят из памяти процессора: %d", rtc_saved_file_index);
         return rtc_saved_file_index;
     }
 
-    // Если там оказался 0 (самый первый старт системы при подаче питания) — 
-    // запускаем ваш проверенный, честный построчный сканер stat, но ищем уже внутри папки photos!
-    ESP_LOGW("SD_INDEX", "[!] RTC-RAM пуста. Запускаем однократное аппаратное сканирование папки photos...");
+    ESP_LOGW("SD_INDEX", "[!] RTC-RAM пуста. Сканируем папку photos на максимальный индекс...");
     
-    int index = 1;
-    char path[64];
-    struct stat st;
-    
-    while (index < 99999) {
-        // Ищем файлы строго внутри нашей новой выделенной папки photos
-        snprintf(path, sizeof(path), "%s/photos/%05d.raw", MOUNT_POINT, index);
-        if (stat(path, &st) != 0) {
-            break; // Файл не найден, значит предыдущий индекс был последним
+    DIR *dir = opendir("/sdcard/photos");
+    int max_index = 0;
+
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            // Ищем файлы, заканчивающиеся на ".raw"
+            if (strstr(entry->d_name, ".raw") != NULL) {
+                int file_idx = 0;
+                // Парсим индекс из конца имени файла. Наш формат: YYYYMMDD_HHMMSS_INDEX.raw
+                // Сканируем последние элементы перед точкой
+                char *underscore = strrchr(entry->d_name, '_');
+                if (underscore && sscanf(underscore + 1, "%d.raw", &file_idx) == 1) {
+                    if (file_idx > max_index) {
+                        max_index = file_idx;
+                    }
+                }
+            }
         }
-        index++;
+        closedir(dir);
     }
     
-    // Вычисляем финальный индекс
-    int final_index = index - 1;
-    
-    // Запоминаем его в RTC-RAM, чтобы больше никогда сюда не заходить!
-    rtc_saved_file_index = final_index;
-    
-    ESP_LOGW("SD_INDEX", "[SUCCESS] Сканирование завершено. Последний файл на флешке: %d. Индекс сохранен в RTC!", final_index);
-    return final_index;
+    rtc_saved_file_index = max_index;
+    ESP_LOGW("SD_INDEX", "[SUCCESS] Последний индекс на флешке: %d. Сохранено в RTC!", max_index);
+    return max_index;
 }
 
 //Функция анализа освещённости кадра
@@ -463,7 +523,6 @@ void app_main(void) {
 	if (mode_prev != 0) // Это может быть, если выгрузка файлов прервалась таймером
 		mode = mode_prev;
     // 3. Сетевой блок (Запускается только если нажатие на кнопку(не таймер) или теплица(mode=3))
-	//if (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER) {
 	if(mode == 1 || mode == 2 || mode == 3) {
 		if (wifi_init_sta()) {
 			ESP_LOGI(TAG, "Wi-Fi ОК. Передача лога ошибок: 0x%X", hardware_errors_mask);
@@ -492,20 +551,34 @@ void app_main(void) {
 
 					uint8_t *file_buf = NULL; size_t file_size = 0;
 
-					if (sd_ok && !(hardware_errors_mask & 0x04)) {
-						char file_path[32]; struct stat st;
-						snprintf(file_path, sizeof(file_path), FILE_PATTERN, MOUNT_POINT, i);
+                    if (sd_ok && !(hardware_errors_mask & 0x04)) {
+                        // Увеличили размер буфера до 64 байт, так как имя файла стало длиннее!
+                        char file_path[64]; 
+                        struct stat st;
 
-						if (stat(file_path, &st) == 0) {
-							file_size = st.st_size;
-							file_buf = heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
-							if (file_buf) {
-								FILE *f = fopen(file_path, "rb");
-								if (f) { fread(file_buf, 1, file_size, f); fclose(f); }
-							}
-						}
-						ESP_LOGI(TAG, "File %s upload", file_path);
-					}
+                        // ИСПОЛЬЗУЕМ НАШУ НОВУЮ ФУНКЦИЮ ПОИСКА:
+                        // Она сканирует папку и сама запишет в file_path точный путь к файлу для индекса "i"
+                        if (find_file_by_index(i, file_path, sizeof(file_path))) {
+                            
+                            // Если файл успешно найден на карте, проверяем его размер через stat
+                            if (stat(file_path, &st) == 0) {
+                                file_size = st.st_size;
+                                file_buf = heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
+                                if (file_buf) {
+                                    FILE *f = fopen(file_path, "rb");
+                                    if (f) { 
+                                        fread(file_buf, 1, file_size, f); 
+                                        fclose(f); 
+                                    }
+                                }
+                            }
+                            ESP_LOGI(TAG, "File %s upload", file_path);
+                        } else {
+                            // Если файл не найден по индексу, логируем предупреждение, 
+                            // протокол не упадет, плата просто продолжит работу
+                            ESP_LOGW(TAG, "File with index %d not found on SD card", i);
+                        }
+                    }
 
 					if (file_buf && file_size > 0) {
 						if (!send_file(file_buf, file_size, i)) { 

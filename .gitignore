@@ -1,6 +1,5 @@
 # Временные файлы сборки ESP-IDF
 build/
-sdkconfig
 sdkconfig.old
 dependencies.lock
 Kconfig.projbuild
