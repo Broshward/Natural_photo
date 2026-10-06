@@ -1,39 +1,54 @@
-#include <stdio.h>
-#include <string.h>
-#include <sys/unistd.h>
-#include <sys/stat.h>
-#include <dirent.h> // Нужен для работы с каталогами
-#include <string.h>
-#include "esp_log.h"
 #include "esp_system.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/event_groups.h"
+#include <dirent.h> // Нужен для работы с каталогами
 #include <sys/time.h>
+#include <time.h>
 
-// Железо и ФС
-#include "esp_camera.h"
 #include "esp_vfs_fat.h"
-#include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
+#include "sdmmc_cmd.h"
 #include "driver/gpio.h"
-#include "ff.h"
-#include "driver/sdspi_host.h" // ВКЛЮЧАЕМ ДРАЙВЕР SPI ДЛЯ КАРТЫ ПАМЯТИ
-#include "driver/spi_common.h"
+#include <sys/unistd.h>
+#include <sys/stat.h>
 #include "driver/rtc_io.h"
 
-// Сеть и OTA
+// Сеть
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
-#include "ota_update.h"
 
+#define MOUNT_POINT "/sdcard"
+
+#include "sdkconfig.h"
+
+#include <esp_log.h>
+#include <esp_system.h>
+#include <nvs_flash.h>
+#include <sys/param.h>
+#include <string.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+// support IDF 5.x
+#ifndef portTICK_RATE_MS
+#define portTICK_RATE_MS portTICK_PERIOD_MS
+#endif
+
+#include "esp_camera.h"
+#include "ota_update.h"
 #include "adc.h"
 
-static const char *TAG = "greenhouse_cam";
+#if defined(CONFIG_CAMERA_AF_SUPPORT) && CONFIG_CAMERA_AF_SUPPORT
+#include "esp_camera_af.h"
+#endif
+
+//#define BOARD_WROVER_KIT 1
+
+#include "camera_pinout.h"
+
 
 #define WIFI_SSID           "SamstillingHeimar"
 #define WIFI_PASS           "HarmoniesWorlds"
@@ -42,32 +57,34 @@ static const char *TAG = "greenhouse_cam";
 
 #define TARGET_PERIOD_SEC   600
 #define MOUNT_POINT         "/sdcard"
-#define FILE_PATTERN		"%s/photos/%04d%02d%02d_%02d%02d%02d_%05d.raw"
+#define FILE_PATTERN		"%s/photos/%04d%02d%02d_%02d%02d%02d_%05d.jpg"
 
 #define DARK_THRESHOLD 70  // Порог темноты (0 - глубокая ночь, 255 - белый лист)
                            // Экспериментально для теплицы обычно подходит от 30 до 45
-
-
-// Пины Freenove V1695
-#define XCLK_GPIO_NUM     15
-#define SIOD_GPIO_NUM     4  
-#define SIOC_GPIO_NUM     5  
-#define Y9_GPIO_NUM       16
-#define Y8_GPIO_NUM       17
-#define Y7_GPIO_NUM       18
-#define Y6_GPIO_NUM       12
-#define Y5_GPIO_NUM       11
-#define Y4_GPIO_NUM       10
-#define Y3_GPIO_NUM       9
-#define Y2_GPIO_NUM       8
-#define VSYNC_GPIO_NUM    6
-#define HREF_GPIO_NUM     7
-#define PCLK_GPIO_NUM     13
-
-static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
+#define CAM_PIN_PWDN -1
+#define CAM_PIN_RESET -1   //software reset will be performed
+#define CAM_PIN_VSYNC 6
+#define CAM_PIN_HREF 7
+#define CAM_PIN_PCLK 13
+#define CAM_PIN_XCLK 15
+#define CAM_PIN_SIOD 4
+#define CAM_PIN_SIOC 5
+#define CAM_PIN_D0 11
+#define CAM_PIN_D1 9
+#define CAM_PIN_D2 8
+#define CAM_PIN_D3 10
+#define CAM_PIN_D4 12
+#define CAM_PIN_D5 18
+#define CAM_PIN_D6 17
+#define CAM_PIN_D7 16
+
+static const char *TAG = "greenhouse_cam";
+static int test_file_index = 1; // Стартовый индекс для тестовых фоток
+
+static EventGroupHandle_t s_wifi_event_group;
 RTC_DATA_ATTR static int boot_count = 0;
 static int last_sent_index = 0; 
 static int server_requested_index = -1;
@@ -79,189 +96,56 @@ static uint32_t hardware_errors_mask = 0;
 RTC_DATA_ATTR static int mode = 0;
 RTC_DATA_ATTR static uint64_t time_to_sleep_enter = 0;
 RTC_DATA_ATTR static int rtc_saved_file_index = 0; // Текущий индекс файла
+static uint64_t session_start_us;
 
+
+
+#if ESP_CAMERA_SUPPORTED
 static camera_config_t camera_config = {
-    .pin_pwdn = -1, 
-	.pin_reset = -1,
-	.pin_xclk = XCLK_GPIO_NUM,
-    .pin_sccb_sda = SIOD_GPIO_NUM,
-	.pin_sccb_scl = SIOC_GPIO_NUM,
-    .pin_d7 = Y9_GPIO_NUM,
-	.pin_d6 = Y8_GPIO_NUM,
-	.pin_d5 = Y7_GPIO_NUM,
-	.pin_d4 = Y6_GPIO_NUM,
-    .pin_d3 = Y5_GPIO_NUM,
-	.pin_d2 = Y4_GPIO_NUM,
-	.pin_d1 = Y3_GPIO_NUM,
-	.pin_d0 = Y2_GPIO_NUM,
-    .pin_vsync = VSYNC_GPIO_NUM, 
-	.pin_href = HREF_GPIO_NUM,
-	.pin_pclk = PCLK_GPIO_NUM,
+    .pin_pwdn = CAM_PIN_PWDN,
+    .pin_reset = CAM_PIN_RESET,
+    .pin_xclk = CAM_PIN_XCLK,
+    .pin_sccb_sda = CAM_PIN_SIOD,
+    .pin_sccb_scl = CAM_PIN_SIOC,
+
+    .pin_d7 = CAM_PIN_D7,
+    .pin_d6 = CAM_PIN_D6,
+    .pin_d5 = CAM_PIN_D5,
+    .pin_d4 = CAM_PIN_D4,
+    .pin_d3 = CAM_PIN_D3,
+    .pin_d2 = CAM_PIN_D2,
+    .pin_d1 = CAM_PIN_D1,
+    .pin_d0 = CAM_PIN_D0,
+    .pin_vsync = CAM_PIN_VSYNC,
+    .pin_href = CAM_PIN_HREF,
+    .pin_pclk = CAM_PIN_PCLK,
+
+    //XCLK 20MHz or 10MHz for OV2640 double FPS (Experimental)
     .xclk_freq_hz = 24000000,
-	.ledc_timer = LEDC_TIMER_0,
-	.ledc_channel = LEDC_CHANNEL_0,
-    .pixel_format = PIXFORMAT_YUV422,
-	.frame_size = FRAMESIZE_SXGA,
-    .jpeg_quality = 12,
-	.fb_count = 1,
-	.grab_mode = CAMERA_GRAB_WHEN_EMPTY,
-	.fb_location = CAMERA_FB_IN_PSRAM    
+    .ledc_timer = LEDC_TIMER_0,
+    .ledc_channel = LEDC_CHANNEL_0,
+
+    .pixel_format = PIXFORMAT_JPEG, //YUV422,GRAYSCALE,RGB565,JPEG
+    .frame_size = FRAMESIZE_5MP,    //QQVGA-UXGA, For ESP32, do not use sizes above QVGA when not JPEG. The performance of the ESP32-S series has improved a lot, but JPEG mode always gives better frame rates.
+
+    .jpeg_quality = 12, //0-63, for OV series camera sensors, lower number means higher quality
+    .fb_count = 1,       //When jpeg mode is used, if fb_count more than one, the driver will work in continuous mode.
+    .fb_location = CAMERA_FB_IN_PSRAM,
+    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
 };
 
-static esp_err_t init_sd_card(sdmmc_card_t** out_card) {
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = { .format_if_mount_failed = false, .max_files = 2, .allocation_unit_size = 0 };
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.flags = SDMMC_HOST_FLAG_1BIT; host.slot = SDMMC_HOST_SLOT_1;
-    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot_config.width = 1; slot_config.clk = GPIO_NUM_39; slot_config.cmd = GPIO_NUM_38; slot_config.d0  = GPIO_NUM_40;
-    return esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot_config, &mount_config, out_card);
-}
-
-uint32_t get_sd_free_space_mb(void) {
-    FATFS *fs; DWORD fre_clust;
-    if (f_getfree("0:", &fre_clust, &fs) != FR_OK) return 0;
-    return (fre_clust * fs->csize) / 2048;
-}
-
-void format_sd_card(void) {
-    ESP_LOGW(TAG, "Низкоуровневая очистка SD...");
-    MKFS_PARM format_opt = { .fmt = FM_ANY, .au_size = 0, .align = 0, .n_fat = 2, .n_root = 512 };
-    if (f_mkfs("0:", &format_opt, NULL, 1024) == FR_OK) {
-        boot_count = 0; last_sent_index = 0;
-    }
-}
-
-// Вспомогательная функция прямой записи в регистр OV3660 через встроенное SCCB API библиотеки
-static int write_sensor_reg(uint16_t reg, uint8_t val) {
-    sensor_t *s = esp_camera_sensor_get();
-    if (!s) return -1;
-    // Вызываем скрытый метод прямой записи в I2C шину датчика
-    return s->set_reg(s, reg, 0xFF, val); 
-}
-static uint8_t read_sensor_reg(uint16_t reg) {
-    sensor_t *s = esp_camera_sensor_get();
-    if (!s) {
-        ESP_LOGE("sensor_debug", "Датчик камеры не инициализирован!");
-        return 0;
-    }
-    // Вызываем скрытый метод чтения: передаем указатель на сенсор, адрес регистра и маску битов (0xFF)
-    return s->get_reg(s, reg, 0xFF);
-}
-
-void shutdown_greenhouse_camera(void) {
-    ESP_LOGW("main_cam", "[!] Отправляем камеру в программный PowerDown...");
-    
-    // Включаем бит 6 в регистре 0x3008, полностью обесточивая матрицу и объектив!
-    write_sensor_reg(0x3008, 0x40); 
-}
-
-camera_fb_t* take_photo(void) {
-    if (esp_camera_init(&camera_config) != ESP_OK) {
-        hardware_errors_mask |= 0x01;
-        return NULL;
-    }
-    
-//	ESP_LOGI(TAG, "Temperature of camera %u", read_sensor_reg(0x6719));
-//	ESP_LOGI(TAG, "Compression enable %u", read_sensor_reg(0x3821));
-//	ESP_LOGI(TAG, "Compression MODE %u", read_sensor_reg(0x4713));
-//	ESP_LOGI(TAG, "SCCB_ID %u", read_sensor_reg(0x4713));
-//
-//    vTaskDelay(pdMS_TO_TICKS(200)); // Даем стабилизироваться кадрам
-
-    // Прогреваем матрицу
-    for (int i = 0; i < 2; i++) {
-        camera_fb_t *fb_flush = esp_camera_fb_get();
-        if (fb_flush) esp_camera_fb_return(fb_flush);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    
-    camera_fb_t *fb_real = esp_camera_fb_get();
-    
-    if (fb_real) {
-        ESP_LOGW("main_cam", "[SUCCESS] Кадр успешно захвачен! Вес файла: %d байт.", fb_real->len);
-    } else {
-        hardware_errors_mask |= 0x02;
-    }
-    
-    return fb_real;    
-}
-
-bool find_file_by_index(int index, char *out_path, size_t max_len) 
+static esp_err_t init_camera(void)
 {
-    DIR *dir = opendir("/sdcard/photos");
-    if (!dir) {
-        ESP_LOGE("SD_READ", "[-] Не удалось открыть каталог /photos");
-        return false;
+    //initialize the camera
+    esp_err_t err = esp_camera_init(&camera_config);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Camera Init Failed");
+		hardware_errors_mask |= 0x01;
+        return err;
     }
 
-    struct dirent *entry;
-    char suffix[16];
-    // Формируем уникальный хвост файла, например: "_00421.raw"
-    snprintf(suffix, sizeof(suffix), "_%05d.raw", index);
-
-    bool found = false;
-
-    // Сканируем файлы в папке
-    while ((entry = readdir(dir)) != NULL) {
-        size_t name_len = strlen(entry->d_name);
-        size_t suffix_len = strlen(suffix);
-
-        // Если имя файла длиннее суффикса, проверяем совпадение с конца строки
-        if (name_len >= suffix_len) {
-            const char *end_of_name = entry->d_name + (name_len - suffix_len);
-            if (strcmp(end_of_name, suffix) == 0) {
-                // Файл найден! Записываем полный путь в буфер ответа
-                snprintf(out_path, max_len, "/sdcard/photos/%s", entry->d_name);
-                found = true;
-                break;
-            }
-        }
-    }
-    closedir(dir);
-
-    if (found) {
-        ESP_LOGI("SD_READ", "[+] Файл для индекса %d успешно найден: %s", index, out_path);
-    } else {
-        ESP_LOGW("SD_READ", "[-] Файл с индексом %d (_%05d.raw) не найден на карте", index, index);
-    }
-
-    return found;
-}
-
-bool save_photo_to_sd(camera_fb_t *fb, int index) 
-{
-    // Принудительно создаем папку. Если она есть, шаг просто пропустится
-    mkdir("/sdcard/photos", 0755); 
-
-    // 1. Получаем текущее время из встроенного RTC-счетчика ESP32-S3
-    time_t now;
-    struct tm timeinfo;
-    time(&now);
-    localtime_r(&now, &timeinfo);
-
-    char file_path[64];
-    // 2. Собираем имя по новому паттерну: путь, дата, время, индекс
-    snprintf(file_path, sizeof(file_path), FILE_PATTERN, 
-             MOUNT_POINT,
-             (timeinfo.tm_year + 1900), 
-             (timeinfo.tm_mon + 1), 
-             timeinfo.tm_mday,
-             timeinfo.tm_hour, 
-             timeinfo.tm_min, 
-             timeinfo.tm_sec,
-             index);
-    
-    ESP_LOGI("SD_WRITE", "Запись кадра: %s", file_path);
-    FILE *f = fopen(file_path, "wb");
-    if (f == NULL) {
-        ESP_LOGE("SD_WRITE", "[-] Ошибка создания файла! Проверьте формат карты.");
-        return false;
-    }
-    
-    size_t written = fwrite(fb->buf, 1, fb->len, f);
-    fclose(f);
-    
-    return (written == fb->len);
+    return ESP_OK;
 }
 
 // --- БЛОК 2: СЕТЕВОЙ СТЭК ---
@@ -306,8 +190,145 @@ int create_connected_socket(void)
     return sock;
 }
 
-// --- БЛОК 3: РАЗДЕЛЬНЫЙ СЕТЕВОЙ ОБМЕН С МАСКОЙ ОШИБОК ---
-// Раздельная функция 1: Отправка информации (Вшиваем маску аппаратных ошибок hardware_errors_mask)
+#if defined(CONFIG_CAMERA_AF_SUPPORT) && CONFIG_CAMERA_AF_SUPPORT
+static void maybe_init_autofocus(void)
+{
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s) {
+        ESP_LOGW(TAG, "AF: no sensor handle");
+        return;
+    }
+
+    if (!esp_camera_af_is_supported(s)) {
+        ESP_LOGI(TAG, "AF: not supported by this sensor");
+        return;
+    }
+
+    esp_camera_af_config_t af_cfg = {
+        .mode = ESP_CAMERA_AF_MODE_AUTO,
+        .timeout_ms = CONFIG_CAMERA_AF_DEFAULT_TIMEOUT_MS,
+    };
+
+    esp_err_t ret = esp_camera_af_init(s, &af_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "AF init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ESP_LOGI(TAG, "AF initialized (AUTO mode)");
+}
+#endif
+#endif
+
+void save_test_frame_to_sd(camera_fb_t *pic) 
+{
+
+    // 2. Генерируем имя по твоему новому паттерну (пока без RTC даты, пишем нули)
+    char file_path[64];
+    snprintf(file_path, sizeof(file_path), "/sdcard/photos/20260925_000000_%05d.jpg", test_file_index);
+
+    // Принудительно создаем папку photos
+    mkdir("/sdcard/photos", 0755);
+
+    ESP_LOGW(TAG, "[*] Запись кадра на флешку: %s ...", file_path);
+    FILE *f = fopen(file_path, "wb");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "[-] Не удалось открыть файл для записи!");
+    } else {
+        size_t written = fwrite(pic->buf, 1, pic->len, f);
+        fclose(f);
+        
+        if (written == pic->len) {
+            ESP_LOGW(TAG, "[SUCCESS] Файл успешно сохранен! %zu байт.", written);
+            test_file_index++; // Инкрементируем индекс только при успешной записи!
+        } else {
+            ESP_LOGE(TAG, "[-] Ошибка: записано только %zu байт из %zu", written, pic->len);
+        }
+    }
+}
+
+static int write_sensor_reg(uint16_t reg, uint8_t val) {
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s) return -1;
+    // Вызываем скрытый метод прямой записи в I2C шину датчика
+    return s->set_reg(s, reg, 0xFF, val);
+}
+
+void shutdown_greenhouse_camera(void) 
+{
+    ESP_LOGW("main_cam", "[!] Отправляем камеру в программный PowerDown...");
+    
+    // Включаем бит 6 в регистре 0x3008, полностью обесточивая матрицу и объектив!
+    write_sensor_reg(0x3008, 0x40); 
+}
+
+static esp_err_t init_sd_card(sdmmc_card_t** out_card) 
+{
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = { .format_if_mount_failed = false, .max_files = 2, .allocation_unit_size = 16 * 1024 };
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.flags = SDMMC_HOST_FLAG_1BIT; host.slot = SDMMC_HOST_SLOT_1;
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot_config.width = 1; slot_config.clk = GPIO_NUM_39; slot_config.cmd = GPIO_NUM_38; slot_config.d0  = GPIO_NUM_40;
+    return esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot_config, &mount_config, out_card);
+}
+
+uint32_t get_sd_free_space_mb(void) 
+{
+    FATFS *fs; DWORD fre_clust;
+    if (f_getfree("0:", &fre_clust, &fs) != FR_OK) return 0;
+    return (fre_clust * fs->csize) / 2048;
+}
+
+void format_sd_card(void) {
+    ESP_LOGW(TAG, "Низкоуровневая очистка SD...");
+    MKFS_PARM format_opt = { .fmt = FM_ANY, .au_size = 0, .align = 0, .n_fat = 2, .n_root = 512 };
+    if (f_mkfs("0:", &format_opt, NULL, 1024) == FR_OK) {
+        boot_count = 0; last_sent_index = 0;
+    }
+}
+
+bool find_file_by_index(int index, char *out_path, size_t max_len) 
+{
+    DIR *dir = opendir("/sdcard/photos");
+    if (!dir) {
+        ESP_LOGE("SD_READ", "[-] Не удалось открыть каталог /photos");
+        return false;
+    }
+
+    struct dirent *entry;
+    char suffix[16];
+    // Формируем уникальный хвост файла, например: "_00421.raw"
+    snprintf(suffix, sizeof(suffix), "_%05d.raw", index);
+
+    bool found = false;
+
+    // Сканируем файлы в папке
+    while ((entry = readdir(dir)) != NULL) {
+        size_t name_len = strlen(entry->d_name);
+        size_t suffix_len = strlen(suffix);
+
+        // Если имя файла длиннее суффикса, проверяем совпадение с конца строки
+        if (name_len >= suffix_len) {
+            const char *end_of_name = entry->d_name + (name_len - suffix_len);
+            if (strcmp(end_of_name, suffix) == 0) {
+                // Файл найден! Записываем полный путь в буфер ответа
+                snprintf(out_path, max_len, "/sdcard/photos/%s", entry->d_name);
+                found = true;
+                break;
+            }
+        }
+    }
+    closedir(dir);
+
+    if (found) {
+        ESP_LOGI("SD_READ", "[+] Файл для индекса %d успешно найден: %s", index, out_path);
+    } else {
+        ESP_LOGW("SD_READ", "[-] Файл с индексом %d (_%05d.raw) не найден на карте", index, index);
+    }
+
+    return found;
+}
+
 bool send_info() 
 {
     int sock = create_connected_socket();
@@ -375,7 +396,57 @@ bool send_file(uint8_t *buf, size_t len, uint32_t index)
     return (ack_idx == (int32_t)index) ? true : false;
 }
 
-// Функция динамического поиска последнего индекса на SD-карте
+
+camera_fb_t *take_photo(void)
+{
+#if defined(CONFIG_CAMERA_AF_SUPPORT) && CONFIG_CAMERA_AF_SUPPORT
+    // Initialize autofocus if configured and supported by the sensor.
+    // In menuconfig: Component config → Camera configuration → Enable autofocus support
+    maybe_init_autofocus();
+#endif
+    // === ШАГ 1: ИНИЦИАЛИЗАЦИЯ КАМЕРЫ НА КРУГЕ ЦИКЛА ===
+    ESP_LOGI(TAG, "Инициализация камеры...");
+    // Вызываем родную функцию примера, которая настраивает камеру
+    if (init_camera() != ESP_OK) {
+        ESP_LOGE(TAG, "[-] Сбой инициализации камеры на этом круге! Пробуем через 5 секунд...");
+        return NULL;
+    }
+
+    // Загрубляем качество (как мы выяснили, это убирает NO-EOI таймауты)
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+        s->set_quality(s, 5); 
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+	ESP_LOGW(TAG, "[*] Запуск безопасного цикла захвата кадра...");
+	int attempt = 0;
+	uint64_t total_elapsed_sec = (esp_timer_get_time() - session_start_us) / 1000000ULL;
+	while (total_elapsed_sec <= (TARGET_PERIOD_SEC - 20)) {
+		attempt++;
+		// === ШАГ 2: ЗАХВАТ КАДРА ===
+		ESP_LOGI(TAG, "Taking picture...");
+		camera_fb_t *pic = esp_camera_fb_get();
+
+		if (pic == NULL) {
+			ESP_LOGE(TAG, "[-] Ошибка: Кадр не получен (Timeout/NO-EOI).");
+		} else {
+			ESP_LOGI(TAG, "[SUCCESS] Picture taken! Its size was: %zu bytes", pic->len);
+			
+			// ПРИНУДИТЕЛЬНО ТУШИМ КАМЕРУ ПОСЛЕ ЦИКЛА
+			shutdown_greenhouse_camera();
+			ESP_LOGI(TAG, "[+] Камера полностью обесточена. Переходим к сетевым задачам.");
+
+			ESP_LOGW(TAG, "[SUCCESS] Валидный кадр захвачен на попытке №%d! Размер: %d байт", attempt, pic->len);
+			return pic;
+		}
+
+		ESP_LOGI(TAG, "--------------------------------------------------");
+		total_elapsed_sec = (esp_timer_get_time() - session_start_us) / 1000000ULL;
+	}
+	return NULL;
+}
+
 int get_last_file_index_from_sd(void) 
 {
     if (rtc_saved_file_index > 0) {
@@ -412,8 +483,8 @@ int get_last_file_index_from_sd(void)
     return max_index;
 }
 
-//Функция анализа освещённости кадра
-bool is_frame_too_dark(uint8_t *yuv_buf, size_t len) {
+bool is_frame_too_dark(uint8_t *yuv_buf, size_t len) 
+{
     uint64_t total_brightness = 0;
     size_t y_pixel_count = 0;
 
@@ -440,9 +511,45 @@ bool is_frame_too_dark(uint8_t *yuv_buf, size_t len) {
     return false; // Кадр нормальный, можно сохранять
 }
 
-// --- БЛОК 4: ИДЕАЛЬНЫЙ СУПЕР-ЛИНЕЙНЫЙ КОНВЕЙЕР ---
-void app_main(void) {
-    uint64_t session_start_us = esp_timer_get_time();
+bool save_photo_to_sd(camera_fb_t *fb, int index) 
+{
+    // Принудительно создаем папку. Если она есть, шаг просто пропустится
+    mkdir("/sdcard/photos", 0755); 
+
+    // 1. Получаем текущее время из встроенного RTC-счетчика ESP32-S3
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    char file_path[64];
+    // 2. Собираем имя по новому паттерну: путь, дата, время, индекс
+    snprintf(file_path, sizeof(file_path), FILE_PATTERN, 
+             MOUNT_POINT,
+             (timeinfo.tm_year + 1900), 
+             (timeinfo.tm_mon + 1), 
+             timeinfo.tm_mday,
+             timeinfo.tm_hour, 
+             timeinfo.tm_min, 
+             timeinfo.tm_sec,
+             index);
+    
+    ESP_LOGI("SD_WRITE", "Запись кадра: %s", file_path);
+    FILE *f = fopen(file_path, "wb");
+    if (f == NULL) {
+        ESP_LOGE("SD_WRITE", "[-] Ошибка создания файла! Проверьте формат карты.");
+        return false;
+    }
+    
+    size_t written = fwrite(fb->buf, 1, fb->len, f);
+    fclose(f);
+    
+    return (written == fb->len);
+}
+
+void app_main(void) 
+{
+    session_start_us = esp_timer_get_time();
 	ESP_LOGW(TAG, "Begin time %lu", session_start_us);
 
     hardware_errors_mask = 0; 
@@ -459,8 +566,6 @@ void app_main(void) {
 
 
 
-	camera_fb_t *fb = NULL;
-	bool sd_ok = false;
 	uint32_t wakeup_mask = esp_sleep_get_wakeup_causes();
 	
 	int mode_prev = mode;
@@ -468,7 +573,7 @@ void app_main(void) {
 	// mode = 0  Photo and save mode. Timer mode. This is ordinary mode. 
 	// mode = 1  Photo mode. Button press mode. Photo & download. Этот mode для настройки камеры. Он делает фото и сразу отправляет его на смартфон. Turns on with a short press of the button
 	// mode = 2  Hold button mode (Download mode). This mode uses for download files. Turns on with a long  press of the button
-	// mode = 3  Greenhouse mode (Photo, saving and download mode). Это режим для теплицы. Кнопка игнорируется. Turns on with uncomment line below 
+	//mode = 3  Greenhouse mode (Photo, saving and download mode). Это режим для теплицы. Кнопка игнорируется. Turns on with uncomment line below 
 	ESP_LOGI(TAG, "PIN 0 is %d", gpio_get_level(0));
 	if (wakeup_mask & (1 << ESP_SLEEP_WAKEUP_TIMER)) // По таймеру 
 		mode = 0; // Timer mode (Photo and save mode). This is ordinary mode.  
@@ -485,14 +590,21 @@ void app_main(void) {
 	ESP_LOGW(TAG, "The mode is %d", mode);
 
 	// 1. Снимаем плановый кадр во временный буфер
+	camera_fb_t *fb = NULL;
 	if (mode == 0 || mode == 1 || mode == 3) { 
-		fb = take_photo();
-		// ПРИНУДИТЕЛЬНО ТУШИМ КАМЕРУ! 
-		shutdown_greenhouse_camera();
-		ESP_LOGI(TAG, "[+] Камера полностью обесточена. Переходим к сетевым задачам.");
-	}
+//        int max_attempts = 15; // Даем камере до 15 попыток на автоэкспозицию
+
+        sensor_t *s = esp_camera_sensor_get();
+        if (s) {
+            s->set_quality(s, 50); // Понижаем качество (12-20), файлы станут меньше, таймауты исчезнут
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
+		fb = take_photo(); 
+    }
 
     // 2. Инициализируем SD-карту 
+	bool sd_ok = false;
 	if (mode==0 || mode == 2 || mode == 3) {
 	    esp_err_t sd_status = init_sd_card(&global_card_handle);
 		if (sd_status == ESP_OK) {
@@ -517,7 +629,7 @@ void app_main(void) {
 				}
 	        }
 			else {
-				ESP_LOGE(TAG, "Error mask: %b", hardware_errors_mask);
+				ESP_LOGE(TAG, "Error mask: %x", hardware_errors_mask);
 				ESP_LOGE(TAG, "fb = 0x%x", fb);
 				if (fb) ESP_LOGE(TAG, "fb->buf = 0x%x", fb->buf);
 				if (fb) ESP_LOGE(TAG, "fb->len = %d", fb->len);
@@ -610,10 +722,9 @@ void app_main(void) {
 	if (mode == 0 || mode == 1 || mode == 3)
 	{
 		esp_camera_fb_return(fb); 
-		esp_camera_deinit(); 
+		esp_camera_deinit(); 		
 	}	
-    // --- ФИНАЛЬНЫЙ СИНХРОННЫЙ УХОД В СОН (БЕЗ МЕТОК) ---
-
+	
     if (sd_ok && global_card_handle) {
         if (format_requested) { 
             format_requested = false; 
@@ -624,6 +735,7 @@ void app_main(void) {
         }
     }
 
+    // --- ФИНАЛЬНЫЙ СИНХРОННЫЙ УХОД В СОН (БЕЗ МЕТОК) ---
     gpio_hold_en(GPIO_NUM_48); 
     esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
 
