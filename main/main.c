@@ -109,7 +109,7 @@ static camera_config_t camera_config = {
 };
 
 static esp_err_t init_sd_card(sdmmc_card_t** out_card) {
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = { .format_if_mount_failed = false, .max_files = 2, .allocation_unit_size = 16 * 1024 };
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = { .format_if_mount_failed = false, .max_files = 2, .allocation_unit_size = 0 };
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.flags = SDMMC_HOST_FLAG_1BIT; host.slot = SDMMC_HOST_SLOT_1;
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
@@ -265,7 +265,6 @@ bool save_photo_to_sd(camera_fb_t *fb, int index)
 }
 
 // --- БЛОК 2: СЕТЕВОЙ СТЭК ---
-
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) 
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
@@ -308,7 +307,6 @@ int create_connected_socket(void)
 }
 
 // --- БЛОК 3: РАЗДЕЛЬНЫЙ СЕТЕВОЙ ОБМЕН С МАСКОЙ ОШИБОК ---
-
 // Раздельная функция 1: Отправка информации (Вшиваем маску аппаратных ошибок hardware_errors_mask)
 bool send_info() 
 {
@@ -357,7 +355,8 @@ bool send_info()
     return true;
 }
 
-bool send_file(uint8_t *buf, size_t len, uint32_t index) {
+bool send_file(uint8_t *buf, size_t len, uint32_t index) 
+{
     int sock = create_connected_socket();
     if (sock < 0) return false;
 
@@ -510,11 +509,20 @@ void app_main(void) {
 	        // Пишем на карту, только если кадр не пустой и маска ошибок не содержит 0x02 и если кадр не слишком тёмный!!!
 	        if (!(hardware_errors_mask & 0x02) && fb && fb->buf && fb->len > 0 && !is_frame_too_dark(fb->buf, fb->len)) {
 	            if (save_photo_to_sd(fb, boot_count)) {
+					ESP_LOGI(TAG, "Фото записано на сд-карту");
 					rtc_saved_file_index = boot_count; 
 	            } else {
+					ESP_LOGE(TAG, "Ошибка записи на сд-карту");
 					hardware_errors_mask |= 0x04;
 				}
 	        }
+			else {
+				ESP_LOGE(TAG, "Error mask: %b", hardware_errors_mask);
+				ESP_LOGE(TAG, "fb = 0x%x", fb);
+				if (fb) ESP_LOGE(TAG, "fb->buf = 0x%x", fb->buf);
+				if (fb) ESP_LOGE(TAG, "fb->len = %d", fb->len);
+
+			}
 	    } else {
 	        hardware_errors_mask |= 0x04; 
 	    }
