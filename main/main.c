@@ -45,10 +45,6 @@
 #include "esp_camera_af.h"
 #endif
 
-//#define BOARD_WROVER_KIT 1
-
-#include "camera_pinout.h"
-
 
 #define WIFI_SSID           "SamstillingHeimar"
 #define WIFI_PASS           "HarmoniesWorlds"
@@ -98,6 +94,8 @@ RTC_DATA_ATTR static uint64_t time_to_sleep_enter = 0;
 RTC_DATA_ATTR static int rtc_saved_file_index = 0; // Текущий индекс файла
 static uint64_t session_start_us;
 
+static char g_dir_path[64]; // Сюда автоматически запишется "/sdcard/photos"
+static char g_file_ext[8];  // Сюда автоматически запишется ".jpg" (или ".raw")
 
 
 #if ESP_CAMERA_SUPPORTED
@@ -146,6 +144,28 @@ static esp_err_t init_camera(void)
     }
 
     return ESP_OK;
+}
+
+void init_file_system_paths(void) {
+    char dummy_path[96];
+    // Генерируем тестовый путь, чтобы вытащить структуру имени файла
+    snprintf(dummy_path, sizeof(dummy_path), FILE_PATTERN, MOUNT_POINT, 2026, 1, 1, 0, 0, 0, 1);
+    
+    // 1. Вытаскиваем путь к папке
+    char *last_slash = strrchr(dummy_path, '/');
+    if (last_slash) {
+        *last_slash = '\0'; // Временно обрезаем строку по последний слэш
+        strcpy(g_dir_path, dummy_path);
+        *last_slash = '/';  // Восстанавливаем строку
+    }
+    
+    // 2. Вытаскиваем расширение (.jpg или .raw)
+    char *last_dot = strrchr(dummy_path, '.');
+    if (last_dot) {
+        strcpy(g_file_ext, last_dot);
+    }
+
+    ESP_LOGW("FS_INIT", "[+] Пути успешно настроены! Папка: %s, Расширение: %s", g_dir_path, g_file_ext);
 }
 
 // --- БЛОК 2: СЕТЕВОЙ СТЭК ---
@@ -220,33 +240,6 @@ static void maybe_init_autofocus(void)
 #endif
 #endif
 
-void save_test_frame_to_sd(camera_fb_t *pic) 
-{
-
-    // 2. Генерируем имя по твоему новому паттерну (пока без RTC даты, пишем нули)
-    char file_path[64];
-    snprintf(file_path, sizeof(file_path), "/sdcard/photos/20260925_000000_%05d.jpg", test_file_index);
-
-    // Принудительно создаем папку photos
-    mkdir("/sdcard/photos", 0755);
-
-    ESP_LOGW(TAG, "[*] Запись кадра на флешку: %s ...", file_path);
-    FILE *f = fopen(file_path, "wb");
-    if (f == NULL) {
-        ESP_LOGE(TAG, "[-] Не удалось открыть файл для записи!");
-    } else {
-        size_t written = fwrite(pic->buf, 1, pic->len, f);
-        fclose(f);
-        
-        if (written == pic->len) {
-            ESP_LOGW(TAG, "[SUCCESS] Файл успешно сохранен! %zu байт.", written);
-            test_file_index++; // Инкрементируем индекс только при успешной записи!
-        } else {
-            ESP_LOGE(TAG, "[-] Ошибка: записано только %zu байт из %zu", written, pic->len);
-        }
-    }
-}
-
 static int write_sensor_reg(uint16_t reg, uint8_t val) {
     sensor_t *s = esp_camera_sensor_get();
     if (!s) return -1;
@@ -289,30 +282,30 @@ void format_sd_card(void) {
 
 bool find_file_by_index(int index, char *out_path, size_t max_len) 
 {
-    DIR *dir = opendir("/sdcard/photos");
+    DIR *dir = opendir(g_dir_path);
     if (!dir) {
-        ESP_LOGE("SD_READ", "[-] Не удалось открыть каталог /photos");
+        ESP_LOGE("SD_READ", "[-] Не удалось открыть каталог: %s", g_dir_path);
         return false;
     }
 
-    struct dirent *entry;
-    char suffix[16];
-    // Формируем уникальный хвост файла, например: "_00421.raw"
-    snprintf(suffix, sizeof(suffix), "_%05d.raw", index);
+    // Вытаскиваем чистый формат имени файла из FILE_PATTERN (всё, что идет после папки)
+    // Из "%s/photos/%04d%02d%02d_%02d%02d%02d_%05d.jpg" 
+    // мы получим строку: "%04d%02d%02d_%02d%02d%02d_%05d.jpg"
+    const char *pattern_filename_part = strrchr(FILE_PATTERN, '/') + 1;
 
+    struct dirent *entry;
     bool found = false;
 
-    // Сканируем файлы в папке
     while ((entry = readdir(dir)) != NULL) {
-        size_t name_len = strlen(entry->d_name);
-        size_t suffix_len = strlen(suffix);
-
-        // Если имя файла длиннее суффикса, проверяем совпадение с конца строки
-        if (name_len >= suffix_len) {
-            const char *end_of_name = entry->d_name + (name_len - suffix_len);
-            if (strcmp(end_of_name, suffix) == 0) {
-                // Файл найден! Записываем полный путь в буфер ответа
-                snprintf(out_path, max_len, "/sdcard/photos/%s", entry->d_name);
+        int y, m, d, hr, min, sec, file_idx;
+        
+        // Пытаемся применить оригинальную маску имени файла К КАЖДОМУ файлу на флешке!
+        // sscanf вернет количество успешно заполненных переменных (у нас их 7 штук)
+        if (sscanf(entry->d_name, pattern_filename_part, &y, &m, &d, &hr, &min, &sec, &file_idx) == 7) {
+            
+            // Если маска совпала и индекс внутри файла равен искомому — файл НАЙДЕН!
+            if (file_idx == index) {
+                snprintf(out_path, max_len, "%s/%s", g_dir_path, entry->d_name);
                 found = true;
                 break;
             }
@@ -323,7 +316,7 @@ bool find_file_by_index(int index, char *out_path, size_t max_len)
     if (found) {
         ESP_LOGI("SD_READ", "[+] Файл для индекса %d успешно найден: %s", index, out_path);
     } else {
-        ESP_LOGW("SD_READ", "[-] Файл с индексом %d (_%05d.raw) не найден на карте", index, index);
+        ESP_LOGW("SD_READ", "[-] Файл с индексом %d не найден на карте памяти", index);
     }
 
     return found;
@@ -412,7 +405,6 @@ camera_fb_t *take_photo(void)
         return NULL;
     }
 
-    // Загрубляем качество (как мы выяснили, это убирает NO-EOI таймауты)
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
         s->set_quality(s, 5); 
@@ -454,21 +446,25 @@ int get_last_file_index_from_sd(void)
         return rtc_saved_file_index;
     }
 
-    ESP_LOGW("SD_INDEX", "[!] RTC-RAM пуста. Сканируем папку photos на максимальный индекс...");
+    ESP_LOGW("SD_INDEX", "[!] RTC-RAM пуста. Сканируем папку %s на максимальный индекс...", g_dir_path);
     
-    DIR *dir = opendir("/sdcard/photos");
+    DIR *dir = opendir(g_dir_path); // Используем динамический путь!
     int max_index = 0;
 
     if (dir) {
         struct dirent *entry;
+        char scan_pattern[16];
+        // Собираем паттерн для sscanf динамически на основе расширения: "%%d%s" -> "%d.jpg"
+        snprintf(scan_pattern, sizeof(scan_pattern), "%%d%s", g_file_ext);
+
         while ((entry = readdir(dir)) != NULL) {
-            // Ищем файлы, заканчивающиеся на ".raw"
-            if (strstr(entry->d_name, ".raw") != NULL) {
+            // Проверяем, что файл заканчивается на наше правильное расширение (.jpg / .raw)
+            if (strstr(entry->d_name, g_file_ext) != NULL) {
                 int file_idx = 0;
-                // Парсим индекс из конца имени файла. Наш формат: YYYYMMDD_HHMMSS_INDEX.raw
-                // Сканируем последние элементы перед точкой
+                // Ищем последний символ '_' в имени файла
                 char *underscore = strrchr(entry->d_name, '_');
-                if (underscore && sscanf(underscore + 1, "%d.raw", &file_idx) == 1) {
+                // Считываем индекс с учетом динамического расширения
+                if (underscore && sscanf(underscore + 1, scan_pattern, &file_idx) == 1) {
                     if (file_idx > max_index) {
                         max_index = file_idx;
                     }
@@ -481,6 +477,25 @@ int get_last_file_index_from_sd(void)
     rtc_saved_file_index = max_index;
     ESP_LOGW("SD_INDEX", "[SUCCESS] Последний индекс на флешке: %d. Сохранено в RTC!", max_index);
     return max_index;
+}
+
+bool is_jpeg_frame_too_dark_professional(void) {
+    // В OV5640 регистры 0x56A0 - 0x56A1 или системный регистр усредненной яркости AEC (0x3A00 / 0x3A1D)
+    // хранят живое текущее значение яркости кадра (Average Luminance), рассчитанное ядром камеры.
+    // Значение меняется от 0 (абсолютная черная тьма) до 255 (ослепительно белый свет).
+    
+    // Читаем системный регистр среднего значения Luminance блока автоматической экспозиции
+    uint8_t camera_internal_brightness = read_ov5640_reg(0x3A15); // Регистр усреднения AEC для OV5640
+    
+    ESP_LOGW("CAM_SENSE", "[⚖️] Внутренняя аппаратная яркость сенсора: %u (Твой порог: %d)", 
+             camera_internal_brightness, DARK_THRESHOLD);
+
+    // Если внутреннее значение яркости самого сенсора ниже твоего порога 70 — в теплице ночь
+    if (camera_internal_brightness < DARK_THRESHOLD) {
+        return true; // Кадр слишком темный, удаляем
+    }
+    
+    return false; // Кадр светлый, можно писать на iBOX
 }
 
 bool is_frame_too_dark(uint8_t *yuv_buf, size_t len) 
@@ -514,7 +529,7 @@ bool is_frame_too_dark(uint8_t *yuv_buf, size_t len)
 bool save_photo_to_sd(camera_fb_t *fb, int index) 
 {
     // Принудительно создаем папку. Если она есть, шаг просто пропустится
-    mkdir("/sdcard/photos", 0755); 
+	mkdir(g_dir_path, 0755); 
 
     // 1. Получаем текущее время из встроенного RTC-счетчика ESP32-S3
     time_t now;
@@ -564,7 +579,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK( ret );
 
-
+	init_file_system_paths(); //Файловые пути и паттерны
 
 	uint32_t wakeup_mask = esp_sleep_get_wakeup_causes();
 	
@@ -593,12 +608,6 @@ void app_main(void)
 	camera_fb_t *fb = NULL;
 	if (mode == 0 || mode == 1 || mode == 3) { 
 //        int max_attempts = 15; // Даем камере до 15 попыток на автоэкспозицию
-
-        sensor_t *s = esp_camera_sensor_get();
-        if (s) {
-            s->set_quality(s, 50); // Понижаем качество (12-20), файлы станут меньше, таймауты исчезнут
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
 
 		fb = take_photo(); 
     }
