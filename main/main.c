@@ -1,3 +1,6 @@
+#include <math.h>
+
+#include "jpeg_decoder.h"
 #include "esp_system.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
@@ -240,6 +243,17 @@ static void maybe_init_autofocus(void)
 #endif
 #endif
 
+// Функция чтения 8-битного регистра камеры через шину SCCB (I2C)
+uint8_t read_sensor_reg(uint16_t reg) {
+    // Получаем указатель на внутренний SCCB-драйвер esp-camera
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s) return 0;
+    
+    // В зависимости от версии esp-camera, у сенсора есть встроенный метод чтения:
+    // Если его нет, используется прямая функция из sccb.h ядра драйвера
+    return s->get_reg(s, reg, 0xFF); 
+}
+
 static int write_sensor_reg(uint16_t reg, uint8_t val) {
     sensor_t *s = esp_camera_sensor_get();
     if (!s) return -1;
@@ -479,51 +493,93 @@ int get_last_file_index_from_sd(void)
     return max_index;
 }
 
-bool is_jpeg_frame_too_dark_professional(void) {
-    // В OV5640 регистры 0x56A0 - 0x56A1 или системный регистр усредненной яркости AEC (0x3A00 / 0x3A1D)
-    // хранят живое текущее значение яркости кадра (Average Luminance), рассчитанное ядром камеры.
-    // Значение меняется от 0 (абсолютная черная тьма) до 255 (ослепительно белый свет).
-    
-    // Читаем системный регистр среднего значения Luminance блока автоматической экспозиции
-    uint8_t camera_internal_brightness = read_ov5640_reg(0x3A15); // Регистр усреднения AEC для OV5640
-    
-    ESP_LOGW("CAM_SENSE", "[⚖️] Внутренняя аппаратная яркость сенсора: %u (Твой порог: %d)", 
-             camera_internal_brightness, DARK_THRESHOLD);
-
-    // Если внутреннее значение яркости самого сенсора ниже твоего порога 70 — в теплице ночь
-    if (camera_internal_brightness < DARK_THRESHOLD) {
-        return true; // Кадр слишком темный, удаляем
-    }
-    
-    return false; // Кадр светлый, можно писать на iBOX
-}
-
-bool is_frame_too_dark(uint8_t *yuv_buf, size_t len) 
+bool is_jpeg_frame_too_dark(uint8_t *jpeg_buf, size_t jpeg_len)
 {
-    uint64_t total_brightness = 0;
-    size_t y_pixel_count = 0;
-
-    // Шаг по буферу: YUV422 хранит байты как Y0, U0, Y1, V0
-    // Нам нужен каждый 2-й байт, начиная с индекса 0 (это Y0, Y1, Y2...)
-    for (size_t i = 0; i < len; i += 2) {
-        total_brightness += yuv_buf[i];
-        y_pixel_count++;
-    }
-
-    if (y_pixel_count == 0) return true; // На всякий случай
-
-    // Считаем среднюю яркость кадра
-    uint8_t average_brightness = (uint8_t)(total_brightness / y_pixel_count);
-
-    // Логируем в консоль для подбора идеального порога
-    ESP_LOGI("CAM_BRIGHT", "Средняя яркость кадра: %u (Порог: %d)", average_brightness, DARK_THRESHOLD);
-
-    // Если средняя яркость меньше порога — кадр слишком темный
-    if (average_brightness < DARK_THRESHOLD) {
+    if (jpeg_buf == NULL || jpeg_len == 0) {
+        ESP_LOGE(TAG, "Неверные входные данные буфера");
         return true; 
     }
 
-    return false; // Кадр нормальный, можно сохранять
+    // 1. Создаем минимальную конфигурацию, чтобы скормить её парсеру заголовков
+    esp_jpeg_image_cfg_t jpeg_cfg = {
+        .indata = jpeg_buf,
+        .indata_size = jpeg_len,
+        .out_format = JPEG_IMAGE_FORMAT_RGB888, 
+        .out_scale = JPEG_IMAGE_SCALE_1_8, // Мы хотим получить размеры с учетом сжатия 1/8
+    };
+
+    esp_jpeg_image_output_t outimg = {0};
+
+        // 2. Вызываем esp_jpeg_get_image_info для чтения оригинальной геометрии кадра
+    if (esp_jpeg_get_image_info(&jpeg_cfg, &outimg) != ESP_OK) {
+        ESP_LOGE(TAG, "Не удалось получить информацию о кадре");
+        return true;
+    }
+
+    // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Функция вернула оригинальный размер (например, 2592х1944).
+    // Так как мы декодируем в масштабе 1/8, уменьшаем размеры вручную для выделения буфера!
+    uint32_t out_width = outimg.width / 8;
+    uint32_t out_height = outimg.height / 8;
+    
+    // Округляем до кратного 8 (требование блочного декодера JPEG для корректных границ)
+    out_width = (out_width + 7) & ~7;
+    out_height = (out_height + 7) & ~7;
+
+    size_t out_buf_size = out_width * out_height * 3; // Для 5МП это будет ~235 КБ вместо 14.7 МБ!
+
+    // 3. Выделяем оперативную память под РЕАЛЬНЫЙ уменьшенный кадр
+    uint8_t *out_img_buf = malloc(out_buf_size);
+    if (out_img_buf == NULL) {
+        ESP_LOGE(TAG, "Не удалось выделить RAM для уменьшенного кадра (%d байт)", out_buf_size);
+        return true;
+    }
+
+    // Обновляем структуру конфигурации правильным буфером
+    jpeg_cfg.outbuf = out_img_buf;
+    jpeg_cfg.outbuf_size = out_buf_size;
+
+    // 4. Запускаем полноценное декодирование
+    esp_err_t err = esp_jpeg_decode(&jpeg_cfg, &outimg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Ошибка декодирования esp_jpeg_decode: %d", err);
+        free(out_img_buf);
+        return true;
+    }
+
+    // 5. Вычисляем среднюю яркость по декодированному кадру
+        uint64_t total_brightness = 0;
+    uint32_t total_pixels = outimg.width * outimg.height;
+    uint8_t max_brightness = 0; // Переменная для поиска самого яркого пикселя
+
+    for (uint32_t i = 0; i < total_pixels; i++) {
+        uint8_t r = out_img_buf[i * 3 + 0];
+        uint8_t g = out_img_buf[i * 3 + 1];
+        uint8_t b = out_img_buf[i * 3 + 2];
+
+        uint8_t brightness = (uint8_t)(0.299f * r + 0.587f * g + 0.114f * b);
+        total_brightness += brightness;
+
+        // Фиксируем максимальное значение
+        if (brightness > max_brightness) {
+            max_brightness = brightness;
+        }
+    }
+
+    free(out_img_buf);
+
+    int avg_brightness = (int)(total_brightness / total_pixels);
+
+    // Выводим оба параметра в лог для анализа
+    ESP_LOGI(TAG, "АНАЛИЗ: Средняя яркость: %d | Максимальная яркость: %d", avg_brightness, max_brightness);
+
+    // Логика определения ночи по двум критериям:
+    // Если даже самый яркий пиксель стал темнее 50 — это гарантированно ночь.
+    if (max_brightness < 50 && avg_brightness < 25) {
+        ESP_LOGW(TAG, "greenhouse_cam: Зафиксирована глубокая ночь!");
+        return true;
+    }
+
+    return false;
 }
 
 bool save_photo_to_sd(camera_fb_t *fb, int index) 
@@ -607,10 +663,8 @@ void app_main(void)
 	// 1. Снимаем плановый кадр во временный буфер
 	camera_fb_t *fb = NULL;
 	if (mode == 0 || mode == 1 || mode == 3) { 
-//        int max_attempts = 15; // Даем камере до 15 попыток на автоэкспозицию
-
 		fb = take_photo(); 
-    }
+	}
 
     // 2. Инициализируем SD-карту 
 	bool sd_ok = false;
@@ -628,7 +682,7 @@ void app_main(void)
 			ESP_LOGI(TAG, "[+] Last file in the card %d", boot_count-1);
 	        
 	        // Пишем на карту, только если кадр не пустой и маска ошибок не содержит 0x02 и если кадр не слишком тёмный!!!
-	        if (!(hardware_errors_mask & 0x02) && fb && fb->buf && fb->len > 0 && !is_frame_too_dark(fb->buf, fb->len)) {
+	        if (!(hardware_errors_mask & 0x02) && fb && fb->buf && fb->len > 0 && !is_jpeg_frame_too_dark(fb->buf, fb->len)) {
 	            if (save_photo_to_sd(fb, boot_count)) {
 					ESP_LOGI(TAG, "Фото записано на сд-карту");
 					rtc_saved_file_index = boot_count; 
