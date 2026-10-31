@@ -32,6 +32,7 @@ class GreenhouseScreen extends StatefulWidget {
 class _GreenhouseScreenState extends State<GreenhouseScreen> {
   ServerSocket? _serverSocket;
   Uint8List? _jpegBytes; 
+  bool _needSyncTimeOnNextConnect = false;
   
   String _statusText = "Статус: Ожидание теплицы...";
   String _batteryText = "Батарея: -- V (--%)";
@@ -41,6 +42,7 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
   
   bool _formatRequested = false;
   bool _otaMode = false;
+  bool _syncTimeRequested = false; // Триггер ручной корректировки времени
   
   final TextEditingController _dialogController = TextEditingController();
 
@@ -120,10 +122,25 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
   }
 
   // ЛИНЕЙНЫЙ ДИСПЕТЧЕР С ПОШАГОВЫМ ОЖИДАНИЕМ БУФЕРА
-   void _handleEsp32Connection(Socket client) async {
+  void _handleEsp32Connection(Socket client) async {
     client.timeout(const Duration(seconds: 15)); 
     final iterator = StreamIterator<Uint8List>(client);
     List<int> currentBuffer = [];
+
+    print("🔗 [FLUTTER] Теплица проснулась и подключилась!");
+
+    // ЕСЛИ ФЛАГ ВЗВЕДЕН — АВТОМАТИЧЕСКИ КОРРЕКТИРУЕМ ВРЕМЯ НА ПЛАТЕ!
+    if (_needSyncTimeOnNextConnect) {
+      final int currentUnixTime = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final String timeCommand = "TIME:$currentUnixTime";
+      
+      client.add(Uint8List.fromList(timeCommand.codeUnits));
+      await client.flush();
+      
+      _needSyncTimeOnNextConnect = false; // Сбрасываем флаг, миссия выполнена!
+      print("⏰ [FLUTTER] На проснувшуюся плату успешно отправлено точное время: $timeCommand");
+    }
+      
 
     try {
       // Шаг 1: Сначала всегда читаем стандартные 16 байт заголовка
@@ -180,19 +197,39 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
         String frameCounterStr = "Всего кадров в теплице: $lastSavedFrameIndex";
 
         // Узнаем, сколько у нас уже скачано локально
-int maxSavedIdx = await get_max_saved_index();
+        int maxSavedIdx = await get_max_saved_index();
 
-setState(() {
-  _queueText = hardwareLog; 
-  _batteryText = batMv > 0 ? "Батарея: ${batV.toStringAsFixed(2)} V ($batPct%)" : "Батарея: USB";
-  _statusText = storageStr;
-  
-  // Сохраняем значения в глобальные переменные состояния класса!
-  _totalFramesOnBoard = lastSavedFrameIndex;
-  _localFramesCount = maxSavedIdx; 
-});
+        setState(() {
+          _queueText = hardwareLog; 
+          _batteryText = batMv > 0 ? "Батарея: ${batV.toStringAsFixed(2)} V ($batPct%)" : "Батарея: USB";
+          _statusText = storageStr;
+          
+          // Сохраняем значения в глобальные переменные состояния класса!
+          _totalFramesOnBoard = lastSavedFrameIndex;
+          _localFramesCount = maxSavedIdx; 
+        });
 
-        if (_otaMode) {
+                // === НАШ НОВЫЙ БЛОК РУЧНОЙ СИНХРОНИЗАЦИИ ВРЕМЕНИ ===
+        if (_syncTimeRequested) {
+          // Получаем точное текущее время смартфона "здесь и сейчас" в секундах
+          final int currentUnixTime = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+          
+          // Формируем команду, например: "TIME:179396412"
+          final String timeCommand = "TIME:$currentUnixTime";
+          
+          // Отправляем на плату через существующий объект client
+          client.add(Uint8List.fromList(timeCommand.codeUnits));
+          await client.flush();
+          
+          setState(() { 
+            _syncTimeRequested = false; // Сбрасываем флаг, миссия выполнена!
+            _statusText = "Время на плате успешно скорректировано!"; 
+          });
+          
+          print("⏰ [FLUTTER] На проснувшуюся плату отправлено время: $timeCommand");
+          await client.close(); iterator.cancel(); return;
+          
+        } else if (_otaMode) {
           // 1. Получаем путь к системной папке приложения динамически
           final extDir = await getExternalStorageDirectory();
           
@@ -246,14 +283,7 @@ setState(() {
           imagePayload.addAll(iterator.current);
         }
 
-        final rawYuvBytes = Uint8List.fromList(imagePayload.sublist(0, imgSize));
-        
-        // --- НАШ НОВЫЙ БЛОК ИЗМЕРЕНИЯ ОСВЕЩЕННОСТИ ---
-        int currentBrightness = _calculateYuv422Brightness(rawYuvBytes);
-        // Выводим жирную и заметную строчку в консоль Flutter (VS Code / Android Studio)
-        print("☀️ [GREENHOUSE CAMERA] Кадр №$imgIndex -> СРЕДНЯЯ ЯРКОСТЬ: $currentBrightness");
-
-        final convertedJpeg = convertYuv422ToJpeg(rawYuvBytes, 1280, 1024);
+        final jpeg = Uint8List.fromList(imagePayload.sublist(0, imgSize));
 
         try {
           final extDir = await getExternalStorageDirectory();
@@ -263,14 +293,14 @@ setState(() {
             
             final fileStringIndex = imgIndex.toString().padLeft(5, '0');
             final file = File('${greenhouseFolder.path}/$fileStringIndex.jpg');
-            await file.writeAsBytes(convertedJpeg); 
+            await file.writeAsBytes(jpeg); 
           }
         } catch (e) { print("Ошибка записи: $e"); }
 
         // Считаем прогресс: текущий индекс кадра делим на общее число сохраненных кадров
         // Здесь вы можете использовать информацию для обновления UI-прогрессбара
         setState(() {
-          _jpegBytes = convertedJpeg;
+          _jpegBytes = jpeg;
           _statusText = "Скачан кадр №${imgIndex.toString().padLeft(5, '0')}";
           
           // Ме мега-удобно инкрементируем наш счетчик скачанных файлов прямо на лету!
@@ -288,23 +318,6 @@ setState(() {
       try { await client.close(); } catch (_) {}
       iterator.cancel();
     }
-  }
-
-  int _calculateYuv422Brightness(Uint8List yuvBytes) {
-    if (yuvBytes.isEmpty) return 0;
-
-    int totalBrightness = 0;
-    int yPixelCount = 0;
-
-    // В YUV422 байты идут: Y0, U0, Y1, V0. 
-    // Нам нужен каждый второй байт (индексы 0, 2, 4, 6...), где лежит яркость Y.
-    for (int i = 0; i < yuvBytes.length; i += 2) {
-      totalBrightness += yuvBytes[i];
-      yPixelCount++;
-    }
-
-    if (yPixelCount == 0) return 0;
-    return totalBrightness ~/ yPixelCount; // Целочисленное деление
   }
 
   void _showFormatDialog() {
@@ -364,23 +377,44 @@ setState(() {
           ElevatedButton(
             style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
             onPressed: () {
-            if (_dialogController.text.trim().toLowerCase() == "firmware") {
-              setState(() { _otaMode = true; _statusText = "Режим OTA активен. Ожидание платы..."; });
-              Navigator.pop(context);
-            }
-          },
-          child: const Text("ОБНОВИТЬ ПО"),
-        )
-      ],
-    ),
-  );
-}
+              if (_dialogController.text.trim().toLowerCase() == "firmware") {
+                setState(() { _otaMode = true; _statusText = "Режим OTA активен. Ожидание платы..."; });
+                Navigator.pop(context);
+              }
+            },
+            child: const Text("ОБНОВИТЬ ПО"),
+          )
+        ],
+      ),
+    );
+  }
+
+  void _sendManualCommand(String command) {
+    if (command.toUpperCase() == 'TIME') {
+      setState(() {
+        _syncTimeRequested = true; // Взводим флаг времени!
+        _statusText = "Команда TIME отложена до подключения платы...";
+      });
+    } else if (command.toUpperCase() == 'FORMAT') {
+      setState(() { 
+        _formatRequested = true; 
+        _statusText = "Команда FORMAT отложена до подключения платы...";
+      });
+    } else if (command.toUpperCase() == 'OTA') {
+      setState(() { 
+        _otaMode = true; });
+        _statusText = "Команда OTA отложена до подключения платы...";
+    }
+    print("⏰ [FLUTTER] Команда ${command} получена.");
+  }
 
 @override
 Widget build(BuildContext context) {
   // Вычисляем, сколько кадров осталось скачать
   int framesLeft = _totalFramesOnBoard - _localFramesCount;
   if (framesLeft < 0) framesLeft = 0;
+
+  final TextEditingController _commandController = TextEditingController();
 
   return Scaffold(
     appBar: AppBar(title: const Text('Greenhouse Control Пульт')),
@@ -434,30 +468,31 @@ Widget build(BuildContext context) {
           ),
           // =======================================================================
 
-          const SizedBox(height: 15),
-          SizedBox(
-            width: double.infinity,
-            height: 48,
-            child: ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.grey),
-              onPressed: _showFormatDialog,
-              child: const Text("ОЧИСТИТЬ ФЛЭШКУ НА ПЛАТЕ", style: TextStyle(fontSize: 14, color: Colors.white)),
-            ),
-          ),
-          const SizedBox(height: 10),
-          SizedBox(
-            width: double.infinity,
-            height: 44,
-            child: OutlinedButton(
-              style: OutlinedButton.styleFrom(
-                side: BorderSide(color: _otaMode ? Colors.blue : Colors.redAccent),
-                backgroundColor: _otaMode ? Colors.blue.withOpacity(0.1) : Colors.transparent,
-              ),
-              onPressed: _showOtaDialog,
-              child: Text(
-                _otaMode ? "ОБНОВЛЕНИЕ ПО: В ЖДУЩЕМ РЕЖИМЕ..." : "ОБНОВИТЬ ПРОШИВКУ (OTA)",
-                style: TextStyle(color: _otaMode ? Colors.blue : Colors.redAccent, fontWeight: FontWeight.bold),
-              ),
+          Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _commandController,
+                    decoration: const InputDecoration(
+                      labelText: 'Введите команду (например, SET_TIME)',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  icon: const Icon(Icons.send),
+                  onPressed: () {
+                    final cmd = _commandController.text.trim();
+                    if (cmd.isNotEmpty) {
+                      _sendManualCommand(cmd);
+                      _commandController.clear();
+                    }
+                  },
+                ),
+              ],
             ),
           ),
         ],
