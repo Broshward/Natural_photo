@@ -58,8 +58,8 @@
 #define MOUNT_POINT         "/sdcard"
 #define FILE_PATTERN		"%s/photos/%04d%02d%02d_%02d%02d%02d_%05d.jpg"
 
-#define DARK_THRESHOLD 70  // Порог темноты (0 - глубокая ночь, 255 - белый лист)
-                           // Экспериментально для теплицы обычно подходит от 30 до 45
+#define DARK_THRESHOLD 200 
+                          
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
@@ -375,8 +375,41 @@ bool send_info()
         } else if (strncmp(rx_buf, "FORMAT_SD", 9) == 0) {
 			ESP_LOGW(TAG, "FORMAT SD-карты...");
             format_requested = true;
+		} else if (strncmp((char*)rx_buf, "TIME:", 5) == 0) {
+			uint64_t timestamp_sec = 0;
+			
+			if (sscanf((char*)rx_buf, "TIME:%llu", &timestamp_sec) == 1) {
+				struct timeval tv = {
+					.tv_sec = timestamp_sec,
+					.tv_usec = 0
+				};
+				
+				// 1. Аппаратно выставляем время в операционной системе платы
+				settimeofday(&tv, NULL);
+				
+				// 2. Принудительно сбрасываем RTC-индекс, чтобы заставить плату
+				// пересканировать iBOX и не допустить наложения имён файлов!
+				rtc_saved_file_index = 0; 
+				
+				// Форматируем для красивого лога в консоль Арча
+				time_t now;
+				struct tm timeinfo;
+				time(&now);
+				localtime_r(&now, &timeinfo);
+				
+				char time_str[64];
+				strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &timeinfo);
+				
+				ESP_LOGW("RTC_SYNC", "[⏰] ВНИМАНИЕ: Ручная корректировка времени! Установлено: %s", time_str);
+				ESP_LOGW("RTC_SYNC", "[🧹] RTC-RAM индекс сброшен для предотвращения наложения файлов.");
+				
+				// Можно отправить ответ в сокет:
+				// send(sock, "TIME_OK", 7, 0);
+			}
         } else if (rx_len == 4) {
-            int32_t rx_index = -1; memcpy(&rx_index, rx_buf, 4); server_requested_index = rx_index;
+            int32_t rx_index = -1; 
+			memcpy(&rx_index, rx_buf, 4); 
+			server_requested_index = rx_index;
         }
     }
     close(sock);
@@ -430,12 +463,17 @@ camera_fb_t *take_photo(void)
 	uint64_t total_elapsed_sec = (esp_timer_get_time() - session_start_us) / 1000000ULL;
 	while (total_elapsed_sec <= (TARGET_PERIOD_SEC - 20)) {
 		attempt++;
+
 		// === ШАГ 2: ЗАХВАТ КАДРА ===
 		ESP_LOGI(TAG, "Taking picture...");
 		camera_fb_t *pic = esp_camera_fb_get();
 
 		if (pic == NULL) {
 			ESP_LOGE(TAG, "[-] Ошибка: Кадр не получен (Timeout/NO-EOI).");
+			if (attempt>3) {
+				shutdown_greenhouse_camera();
+				return pic;
+			}
 		} else {
 			ESP_LOGI(TAG, "[SUCCESS] Picture taken! Its size was: %zu bytes", pic->len);
 			
@@ -500,86 +538,90 @@ bool is_jpeg_frame_too_dark(uint8_t *jpeg_buf, size_t jpeg_len)
         return true; 
     }
 
-    // 1. Создаем минимальную конфигурацию, чтобы скормить её парсеру заголовков
+    // 1. Настройка конфигурации для предварительного чтения заголовка
     esp_jpeg_image_cfg_t jpeg_cfg = {
         .indata = jpeg_buf,
         .indata_size = jpeg_len,
         .out_format = JPEG_IMAGE_FORMAT_RGB888, 
-        .out_scale = JPEG_IMAGE_SCALE_1_8, // Мы хотим получить размеры с учетом сжатия 1/8
+        .out_scale = JPEG_IMAGE_SCALE_1_8, // Декодируем в масштабе 1/8
     };
 
     esp_jpeg_image_output_t outimg = {0};
 
-        // 2. Вызываем esp_jpeg_get_image_info для чтения оригинальной геометрии кадра
+    // Читаем геометрию кадра из заголовка
     if (esp_jpeg_get_image_info(&jpeg_cfg, &outimg) != ESP_OK) {
         ESP_LOGE(TAG, "Не удалось получить информацию о кадре");
         return true;
     }
 
-    // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Функция вернула оригинальный размер (например, 2592х1944).
-    // Так как мы декодируем в масштабе 1/8, уменьшаем размеры вручную для выделения буфера!
-    uint32_t out_width = outimg.width / 8;
-    uint32_t out_height = outimg.height / 8;
-    
-    // Округляем до кратного 8 (требование блочного декодера JPEG для корректных границ)
-    out_width = (out_width + 7) & ~7;
-    out_height = (out_height + 7) & ~7;
+    // Вручную уменьшаем размеры под масштаб 1/8 и выравниваем до кратного 8
+    uint32_t out_width = (outimg.width / 8 + 7) & ~7;
+    uint32_t out_height = (outimg.height / 8 + 7) & ~7;
+    size_t out_buf_size = out_width * out_height * 3; 
 
-    size_t out_buf_size = out_width * out_height * 3; // Для 5МП это будет ~235 КБ вместо 14.7 МБ!
-
-    // 3. Выделяем оперативную память под РЕАЛЬНЫЙ уменьшенный кадр
+    // 2. Выделяем оперативную память под уменьшенный кадр
     uint8_t *out_img_buf = malloc(out_buf_size);
     if (out_img_buf == NULL) {
-        ESP_LOGE(TAG, "Не удалось выделить RAM для уменьшенного кадра (%d байт)", out_buf_size);
+        ESP_LOGE(TAG, "Не удалось выделить RAM для кадра (%d байт)", out_buf_size);
         return true;
     }
 
-    // Обновляем структуру конфигурации правильным буфером
     jpeg_cfg.outbuf = out_img_buf;
     jpeg_cfg.outbuf_size = out_buf_size;
 
-    // 4. Запускаем полноценное декодирование
-    esp_err_t err = esp_jpeg_decode(&jpeg_cfg, &outimg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Ошибка декодирования esp_jpeg_decode: %d", err);
+    // 3. Запускаем декодирование
+    if (esp_jpeg_decode(&jpeg_cfg, &outimg) != ESP_OK) {
+        ESP_LOGE(TAG, "Ошибка декодирования JPEG кадра");
         free(out_img_buf);
         return true;
     }
 
-    // 5. Вычисляем среднюю яркость по декодированному кадру
-        uint64_t total_brightness = 0;
+    // 4. Полнокадровый расчет тестовых метрик
     uint32_t total_pixels = outimg.width * outimg.height;
-    uint8_t max_brightness = 0; // Переменная для поиска самого яркого пикселя
+    uint64_t total_brightness = 0;
+    uint8_t max_brightness = 0;
+    uint8_t min_brightness = 255; // Инициализируем максимумом для корректного поиска минимума
 
     for (uint32_t i = 0; i < total_pixels; i++) {
         uint8_t r = out_img_buf[i * 3 + 0];
         uint8_t g = out_img_buf[i * 3 + 1];
         uint8_t b = out_img_buf[i * 3 + 2];
 
+        // Стандартный перевод RGB в яркость (Digital ITU BT.601)
         uint8_t brightness = (uint8_t)(0.299f * r + 0.587f * g + 0.114f * b);
+
+        // Накапливаем сумму для среднего значения
         total_brightness += brightness;
 
-        // Фиксируем максимальное значение
+        // Фиксируем максимальный пик
         if (brightness > max_brightness) {
             max_brightness = brightness;
         }
+
+        // Фиксируем минимальное значение
+        if (brightness < min_brightness) {
+            min_brightness = brightness;
+        }
     }
 
+    // Сразу освобождаем буфер изображения
     free(out_img_buf);
 
-    int avg_brightness = (int)(total_brightness / total_pixels);
+    // Вычисляем целочисленное среднее значение с математическим округлением
+    int avg_brightness = (int)((total_brightness + (total_pixels / 2)) / total_pixels);
 
-    // Выводим оба параметра в лог для анализа
-    ESP_LOGI(TAG, "АНАЛИЗ: Средняя яркость: %d | Максимальная яркость: %d", avg_brightness, max_brightness);
+    // 5. Вывод всех трех метрик в консоль для глубокого тестирования
+    ESP_LOGI(TAG, "Тест яркости -> Минимальная: %d | Средняя: %d | Максимальная: %d", 
+             min_brightness, avg_brightness, max_brightness);
 
-    // Логика определения ночи по двум критериям:
-    // Если даже самый яркий пиксель стал темнее 50 — это гарантированно ночь.
-    if (max_brightness < 50 && avg_brightness < 25) {
-        ESP_LOGW(TAG, "greenhouse_cam: Зафиксирована глубокая ночь!");
-        return true;
+    // 6. Логическое решение по-прежнему зависит ТОЛЬКО от максимальной яркости
+    if (max_brightness < DARK_THRESHOLD) {
+        ESP_LOGW(TAG, "greenhouse_cam: Наступила ночь! (Максимум %d < Порога %d)", 
+                 max_brightness, DARK_THRESHOLD);
+        return true; // Темно (ночь)
     }
 
-    return false;
+    return false; // Светло (день)
 }
 
 bool save_photo_to_sd(camera_fb_t *fb, int index) 
@@ -692,11 +734,11 @@ void app_main(void)
 				}
 	        }
 			else {
-				ESP_LOGE(TAG, "Error mask: %x", hardware_errors_mask);
+				ESP_LOGE(TAG, "Error hardware mask: %x", hardware_errors_mask);
 				ESP_LOGE(TAG, "fb = 0x%x", fb);
 				if (fb) ESP_LOGE(TAG, "fb->buf = 0x%x", fb->buf);
 				if (fb) ESP_LOGE(TAG, "fb->len = %d", fb->len);
-
+				if (is_jpeg_frame_too_dark(fb->buf, fb->len)) ESP_LOGE(TAG, "jpeg frame too dark!");
 			}
 	    } else {
 	        hardware_errors_mask |= 0x04; 
