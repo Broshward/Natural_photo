@@ -98,13 +98,20 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
           final files = rootDir.listSync();
           for (var file in files) {
             if (file is File && file.path.endsWith(".jpg")) {
+              // Получаем чистое имя файла без пути и без расширения (например, "20261031_161400_00005")
               final name = file.path.split('/').last.split('.').first;
-              print("File name = $name\n");
-              final idx = int.tryParse(name) ?? 0;
-              print("File index = $idx\n");
+              print("File name = $name");
+              
+              // НАШ ХАК: Разрезаем имя по символу '_' и забираем самый последний элемент ("00005")
+              final indexPart = name.split('_').last;
+              
+              // Теперь этот кусок гарантированно и чисто распарсится в нормальное число!
+              final idx = int.tryParse(indexPart) ?? 0;
+              print("File index = $idx");
+              
               if (idx > maxIndex) maxIndex = idx;
             }
-          }
+          }          
         }
       }
     } catch (_) {}
@@ -121,6 +128,27 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
     } catch (e) {
       setState(() { _statusText = "Ошибка порта 8888: $e"; });
     }
+  }
+
+  DateTime? _parseDateTimeFromFileName(String fileName) {
+    try {
+      // Наш формат имени: YYYYMMDD_HHMMSS_INDEX.jpg
+      // Пример: 20261101_153022_00001.jpg
+      if (fileName.length >= 15) {
+        final year = int.parse(fileName.substring(0, 4));
+        final month = int.parse(fileName.substring(4, 6));
+        final day = int.parse(fileName.substring(6, 8));
+        
+        final hour = int.parse(fileName.substring(9, 11));
+        final minute = int.parse(fileName.substring(11, 13));
+        final second = int.parse(fileName.substring(13, 15));
+        
+        return DateTime(year, month, day, hour, minute, second);
+      }
+    } catch (e) {
+      print("❌ [DATETIME_PARSER] Не удалось распарсить дату из имени файла: $e");
+    }
+    return null;
   }
 
   // ЛИНЕЙНЫЙ ДИСПЕТЧЕР С ПОШАГОВЫМ ОЖИДАНИЕМ БУФЕРА
@@ -318,6 +346,14 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
             
             final file = File('${greenhouseFolder.path}/$originalFileName');
             await file.writeAsBytes(jpegBytes); 
+
+            // === НАШ НОВЫЙ БЛОК КОРРЕКТИРОВКИ СИСТЕМНОГО ВРЕМЕНИ ФАЙЛА ===
+            final fileDateTime = _parseDateTimeFromFileName(originalFileName);
+            if (fileDateTime != null) {
+              // Насильно выставляем операционной системе телефона время изменения файла!
+              await file.setLastModified(fileDateTime);
+              print("⏰ [FLUTTER] Системное время файла обновлено на: $fileDateTime");
+            }
           }
         } catch (e) { print("Ошибка записи файла: $e"); }
 
