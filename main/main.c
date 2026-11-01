@@ -149,7 +149,8 @@ static esp_err_t init_camera(void)
     return ESP_OK;
 }
 
-void init_file_system_paths(void) {
+void init_file_system_paths(void) 
+{
     char dummy_path[96];
     // Генерируем тестовый путь, чтобы вытащить структуру имени файла
     snprintf(dummy_path, sizeof(dummy_path), FILE_PATTERN, MOUNT_POINT, 2026, 1, 1, 0, 0, 0, 1);
@@ -416,14 +417,25 @@ bool send_info()
     return true;
 }
 
-bool send_file(uint8_t *buf, size_t len, uint32_t index) 
+bool send_file(uint8_t *buf, size_t len, uint32_t index, const char *full_path) 
 {
     int sock = create_connected_socket();
     if (sock < 0) return false;
 
-    uint32_t header[4] = { index, (uint32_t)len, 0, 0 };
+    // 1. Вытаскиваем чистое имя файла из пути
+    const char *file_name = strrchr(full_path, '/');
+    file_name = (file_name) ? (file_name + 1) : full_path;
+    uint32_t name_len = strlen(file_name);
+
+    // 2. ОТПРАВЛЯЕМ СНАЧАЛА ФИКСИРОВАННЫЙ ХЕДЕР (16 БАЙТ)
+    // Передаем индекс, размер картинки и ДЛИНУ ИМЕНИ файла
+    uint32_t header[4] = { index, (uint32_t)len, name_len, 0 };
     if (send(sock, header, sizeof(header), 0) < 0) { close(sock); return false; }
 
+    // 3. ОТПРАВЛЯЕМ САМО ИМЯ ФАЙЛА (строго name_len байт, БЕЗ всяких \n)
+    if (send(sock, file_name, name_len, 0) < 0) { close(sock); return false; }
+
+    // 4. ТВОЙ РАБОЧИЙ ЦИКЛ ОТПРАВКИ ТЕЛА ФАЙЛА (JPEG)
     size_t total_sent = 0;
     while (total_sent < len) {
         size_t to_send = (len - total_sent > 4096) ? 4096 : (len - total_sent);
@@ -431,11 +443,14 @@ bool send_file(uint8_t *buf, size_t len, uint32_t index)
         if (sent < 0) { close(sock); return false; }
         total_sent += sent;
     }
-    int32_t ack_idx = -1; recv(sock, &ack_idx, sizeof(ack_idx), 0);
+
+    // Ожидание подтверждения ACK
+    int32_t ack_idx = -1; 
+    recv(sock, &ack_idx, sizeof(ack_idx), 0);
     close(sock);
+    
     return (ack_idx == (int32_t)index) ? true : false;
 }
-
 
 camera_fb_t *take_photo(void)
 {
@@ -775,10 +790,10 @@ void app_main(void)
 					}
 
 					uint8_t *file_buf = NULL; size_t file_size = 0;
+					char file_path[64]; 
 
                     if (sd_ok && !(hardware_errors_mask & 0x04)) {
                         // Увеличили размер буфера до 64 байт, так как имя файла стало длиннее!
-                        char file_path[64]; 
                         struct stat st;
 
                         // ИСПОЛЬЗУЕМ НАШУ НОВУЮ ФУНКЦИЮ ПОИСКА:
@@ -806,15 +821,13 @@ void app_main(void)
                     }
 
 					if (file_buf && file_size > 0) {
-						if (!send_file(file_buf, file_size, i)) { 
+						if (!send_file(file_buf, file_size, i, file_path)) { 
 							heap_caps_free(file_buf); 
 							break; 
 						}
 						last_sent_index = i;
 						heap_caps_free(file_buf);
 						vTaskDelay(pdMS_TO_TICKS(15));
-					} else if (i == boot_count && fb && fb->buf && fb->len > 0) {
-						if (send_file(fb->buf, fb->len, i)) { last_sent_index = i; }
 					}
 				}
 				if (mode_change) mode = 0;

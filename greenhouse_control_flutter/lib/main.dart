@@ -99,7 +99,9 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
           for (var file in files) {
             if (file is File && file.path.endsWith(".jpg")) {
               final name = file.path.split('/').last.split('.').first;
+              print("File name = $name\n");
               final idx = int.tryParse(name) ?? 0;
+              print("File index = $idx\n");
               if (idx > maxIndex) maxIndex = idx;
             }
           }
@@ -273,44 +275,66 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
       }
 
       // =======================================================================
-      // СЦЕНАРИЙ Б: Прием файла (ESP32 прислала строго 16 байт заголовка)
+      // СЦЕНАРИЙ Б: Прием файла (16 байт хедера -> Имя файла -> Тело JPEG)
       // =======================================================================
-      if (imgSize > 0) {
-        // Отрезаем ровно 16 байт заголовка, всё остальное — это байты нашей картинки
-        List<int> imagePayload = currentBuffer.sublist(16);
-        while (imagePayload.length < imgSize) {
+      if (currentBuffer.length >= 16) {
+        // 1. ЧИТАЕМ СТРОГО 16 БАЙТ ХЕДЕРА
+        final headerBytes = currentBuffer.sublist(0, 16);
+        final headerData = ByteData.view(Uint8List.fromList(headerBytes).buffer);
+        
+        final int actualImgIndex = headerData.getUint32(0, Endian.little);
+        final int actualImgSize = headerData.getUint32(4, Endian.little);
+        final int nameLen = headerData.getUint32(8, Endian.little); // Длина имени!
+
+        // Ждем, пока в буфер долетит всё остальное (имя файла + сам JPEG)
+        // Общий размер данных в этой сессии: 16 (хедер) + длина имени + размер картинки
+        int totalExpectedBytes = 16 + nameLen + actualImgSize;
+        
+        while (currentBuffer.length < totalExpectedBytes) {
           if (!await iterator.moveNext()) break;
-          imagePayload.addAll(iterator.current);
+          currentBuffer.addAll(iterator.current);
         }
 
-        final jpeg = Uint8List.fromList(imagePayload.sublist(0, imgSize));
+        // 2. ВЫРЕЗАЕМ ИМЯ ФАЙЛА (оно идет строго после 16-ти байт хедера)
+        final nameBytes = currentBuffer.sublist(16, 16 + nameLen);
+        String originalFileName = String.fromCharCodes(nameBytes).trim();
 
+        if (originalFileName.isEmpty) {
+          originalFileName = "${actualImgIndex.toString().padLeft(5, '0')}.jpg";
+        }
+
+        // 3. ВЫРЕЗАЕМ ТЕЛО JPEG (оно идет строго после хедера и имени файла)
+        final int jpegStartOffset = 16 + nameLen;
+        final jpegBytes = Uint8List.fromList(
+          currentBuffer.sublist(jpegStartOffset, jpegStartOffset + actualImgSize)
+        );
+
+        // 4. ЗАПИСЫВАЕМ НА ДИСК ПОД ОРИГИНАЛЬНЫМ ИМЕНЕМ
         try {
           final extDir = await getExternalStorageDirectory();
           if (extDir != null) {
             final greenhouseFolder = Directory('${extDir.path}/greenhouse_archive');
             if (!greenhouseFolder.existsSync()) greenhouseFolder.createSync(recursive: true);
             
-            final fileStringIndex = imgIndex.toString().padLeft(5, '0');
-            final file = File('${greenhouseFolder.path}/$fileStringIndex.jpg');
-            await file.writeAsBytes(jpeg); 
+            final file = File('${greenhouseFolder.path}/$originalFileName');
+            await file.writeAsBytes(jpegBytes); 
           }
-        } catch (e) { print("Ошибка записи: $e"); }
+        } catch (e) { print("Ошибка записи файла: $e"); }
 
-        // Считаем прогресс: текущий индекс кадра делим на общее число сохраненных кадров
-        // Здесь вы можете использовать информацию для обновления UI-прогрессбара
+        // Обновляем интерфейс приложения
         setState(() {
-          _jpegBytes = jpeg;
-          _statusText = "Скачан кадр №${imgIndex.toString().padLeft(5, '0')}";
-          
-          // Ме мега-удобно инкрементируем наш счетчик скачанных файлов прямо на лету!
-          _localFramesCount = imgIndex; 
+          _jpegBytes = jpegBytes;
+          _statusText = "Скачан кадр: $originalFileName";
+          _localFramesCount = actualImgIndex; 
         });
         
-
-        final ack = ByteData(4)..setInt32(0, imgIndex, Endian.little);
+        // Отправляем плате подтверждение ACK по реальному индексу кадра
+        final ack = ByteData(4)..setInt32(0, actualImgIndex, Endian.little);
         client.add(ack.buffer.asUint8List());
-        await client.flush(); await client.close(); iterator.cancel();
+        await client.flush(); 
+        await client.close(); 
+        iterator.cancel();
+        return;
       }
 
     } catch (e) {
