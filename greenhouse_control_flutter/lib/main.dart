@@ -450,22 +450,34 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
   }
 
   void _sendManualCommand(String command) {
-    if (command.toUpperCase() == 'TIME') {
+    final upperCmd = command.toUpperCase();
+
+    // Проверяем команду на соответствие нашему списку
+    if (upperCmd == 'SET_TIME') {
       setState(() {
-        _syncTimeRequested = true; // Взводим флаг времени!
-        _statusText = "Команда TIME отложена до подключения платы...";
+        _syncTimeRequested = true;
+        _statusText = "⏰ Команда SET_TIME отложена до подключения платы...";
       });
-    } else if (command.toUpperCase() == 'FORMAT') {
+      print("⏰ [FLUTTER] Флаг синхронизации времени взведен.");
+    } else if (upperCmd == 'FORMAT_SD') {
       setState(() { 
         _formatRequested = true; 
-        _statusText = "Команда FORMAT отложена до подключения платы...";
+        _statusText = "💾 Команда FORMAT_SD отложена до подключения платы...";
       });
-    } else if (command.toUpperCase() == 'OTA') {
+      print("💾 [FLUTTER] Флаг форматирования SD взведен.");
+    } else if (upperCmd == 'OTA') {
       setState(() { 
-        _otaMode = true; });
-        _statusText = "Команда OTA отложена до подключения платы...";
+        _otaMode = true; 
+        _statusText = "🚀 Режим OTA отложен до подключения платы...";
+      });
+      print("🚀 [FLUTTER] Режим OTA взведен.");
+    } else {
+      // ЕСЛИ КОМАНДА НЕ РАСПОЗНАНА:
+      setState(() {
+        _statusText = "❌ Ошибка: Неизвестная команда '$command'!";
+      });
+      print("⚠️ [FLUTTER] Попытка ввода неверной команды: $command");
     }
-    print("⏰ [FLUTTER] Команда ${command} получена.");
   }
 
 @override
@@ -535,6 +547,18 @@ Widget build(BuildContext context) {
                 Expanded(
                   child: TextField(
                     controller: _commandController,
+                    // Указываем тип действия для кнопки клавиатуры — "Отправить"
+                    textInputAction: TextInputAction.send, 
+                    // ХАК №1: Отправка и скрытие клавиатуры при нажатии на Enter/галочку самой клавиатуры!
+                    onSubmitted: (value) {
+                      final cmd = value.trim();
+                      if (cmd.isNotEmpty) {
+                        _sendManualCommand(cmd);
+                        _commandController.clear();
+                      }
+                      // ХАК №2: Убираем фокус с поля, принудительно пряча клавиатуру!
+                      FocusScope.of(context).unfocus();
+                    },
                     decoration: const InputDecoration(
                       labelText: 'Введите команду (например, SET_TIME)',
                       border: OutlineInputBorder(),
@@ -550,11 +574,13 @@ Widget build(BuildContext context) {
                       _sendManualCommand(cmd);
                       _commandController.clear();
                     }
+                    // Прячем клавиатуру и при нажатии на обычную кнопку-иконку на экране!
+                    FocusScope.of(context).unfocus();
                   },
                 ),
               ],
             ),
-          ),
+          )
         ],
       ),
     ),
