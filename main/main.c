@@ -96,6 +96,7 @@ RTC_DATA_ATTR static int mode = 0;
 RTC_DATA_ATTR static uint64_t time_to_sleep_enter = 0;
 RTC_DATA_ATTR static int rtc_saved_file_index = 0; // Текущий индекс файла
 static uint64_t session_start_us;
+static bool ota_requested = false; // Отложенный перезапуск после обновления ПО
 
 static char g_dir_path[64]; // Сюда автоматически запишется "/sdcard/photos"
 static char g_file_ext[8];  // Сюда автоматически запишется ".jpg" (или ".raw")
@@ -349,68 +350,71 @@ bool send_info()
     uint32_t header[5] = { hardware_errors_mask, 0, bat_mv, free_mb, rtc_saved_file_index };
     if (send(sock, header, sizeof(header), 0) < 0) { close(sock); return false; }
 
-    char rx_buf[32] = {0};
-    int rx_len = recv(sock, rx_buf, sizeof(rx_buf) - 1, 0);
-    if (rx_len > 0) {
-        if (strncmp(rx_buf, "OTA:", 4) == 0) {
-            size_t ota_size = 0;
-            if (sscanf(rx_buf, "OTA:%d", &ota_size) == 1 && ota_size > 0) {
+	char rx_buf[128] = {0};
+    // Запускаем цикл чтения сокета, пока от Flutter летят сервисные команды
+    while (1) {
+        memset(rx_buf, 0, sizeof(rx_buf));
+        int rx_len = recv(sock, rx_buf, sizeof(rx_buf) - 1, 0);
+        
+        // Если сокет закрылся или произошла ошибка таймаута — выходим из цикла
+        if (rx_len <= 0) {
+            break; 
+        }
+
+        ESP_LOGI(TAG, "Получен сетевой пакет (%d байт): %s", rx_len, rx_buf);
+
+        // --- 1. ОБРАБОТКА КОМАНДЫ СИНХРОНИЗАЦИИ ВРЕМЕНИ ---
+        // Ищем подстроку "TIME:" в любой точке буфера
+        char *time_ptr = strstr(rx_buf, "TIME:");
+        if (time_ptr) {
+            uint64_t timestamp_sec = 0;
+            if (sscanf(time_ptr, "TIME:%llu", &timestamp_sec) == 1) {
+                struct timeval tv = { .tv_sec = timestamp_sec, .tv_usec = 0 };
+                settimeofday(&tv, NULL);
+                rtc_saved_file_index = 0; // Сброс индекса под новое время
                 
-                // Увеличиваем таймаут текущего сокета до 30 секунд для приема тяжелого файла
+                time_t now; struct tm timeinfo; time(&now); localtime_r(&now, &timeinfo);
+                char time_str[64]; strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &timeinfo);
+                ESP_LOGW("RTC_SYNC", "[⏰] Ручная корректировка времени выполнена: %s", time_str);
+            }
+        }
+
+        // --- 2. ОБРАБОТКА КОМАНДЫ ФОРМАТИРОВАНИЯ ---
+        if (strstr(rx_buf, "FORMAT_SD") != NULL) {
+            ESP_LOGW(TAG, "💾 Запрос FORMAT SD-карты принят!");
+            format_requested = true;
+        }
+
+        // --- 3. ОБРАБОТКА СТАНДАРТНОГО ИНДЕКСА СИНХРОНИЗАЦИИ ФОТОК ---
+        // Если прилетело ровно 4 байта (числовой индекс от старой логики телефона)
+        if (rx_len == 4 && !time_ptr) {
+            int32_t rx_index = -1; 
+            memcpy(&rx_index, rx_buf, 4); 
+            server_requested_index = rx_index;
+            ESP_LOGW(TAG, "[🎯] Получен индекс синхронизации от смартфона: %d", server_requested_index);		
+            break; // Получили индекс синхронизации — выходим из цикла команд к передаче фоток!
+        }
+
+        // --- 4. ОБРАБОТКА КОМАНДЫ OTA (СТРОГО В КОНЦЕ!) ---
+        char *ota_ptr = strstr(rx_buf, "OTA:");
+        if (ota_ptr) {
+            size_t ota_size = 0;
+            if (sscanf(ota_ptr, "OTA:%d", &ota_size) == 1 && ota_size > 0) {
                 struct timeval ota_timeout = { .tv_sec = 30, .tv_usec = 0 };
                 setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &ota_timeout, sizeof(ota_timeout));
                 
-                ESP_LOGW(TAG, "Команда ОТА принята. Отправка READY в текущий сокет...");
-
-                // Шлем READY прямо в этот же сокет
+                ESP_LOGW(TAG, "🚀 Команда ОТА принята. Загрузка бинарника...");
                 send(sock, "READY", 5, 0);
                 vTaskDelay(pdMS_TO_TICKS(500)); 
                 
-                // Запускаем прошивку, передавая ей НАШ ТЕКУЩИЙ АКТИВНЫЙ СОКЕТ sock!
+                // Скачиваем прошивку в пассивный OTA-раздел флеш-памяти чипа
                 if (perform_tcp_ota(sock, ota_size)) { 
-                    close(sock); 
-                    vTaskDelay(pdMS_TO_TICKS(500)); 
-                    esp_restart(); 
+                    ESP_LOGW(TAG, "[🚀] Прошивка успешно принята! Перезапуск отложен до очистки SD.");
+                    ota_requested = true; // ВЗВОДИМ ФЛАГ ОБНОВЛЕНИЯ ПО
+                    close(sock);
+                    break; // Красиво выходим из сетевого цикла
                 }
             }
-        } else if (strncmp(rx_buf, "FORMAT_SD", 9) == 0) {
-			ESP_LOGW(TAG, "FORMAT SD-карты...");
-            format_requested = true;
-		} else if (strncmp((char*)rx_buf, "TIME:", 5) == 0) {
-			uint64_t timestamp_sec = 0;
-			
-			if (sscanf((char*)rx_buf, "TIME:%llu", &timestamp_sec) == 1) {
-				struct timeval tv = {
-					.tv_sec = timestamp_sec,
-					.tv_usec = 0
-				};
-				
-				// 1. Аппаратно выставляем время в операционной системе платы
-				settimeofday(&tv, NULL);
-				
-				// 2. Принудительно сбрасываем RTC-индекс, чтобы заставить плату
-				// пересканировать iBOX и не допустить наложения имён файлов!
-				rtc_saved_file_index = 0; 
-				
-				// Форматируем для красивого лога в консоль Арча
-				time_t now;
-				struct tm timeinfo;
-				time(&now);
-				localtime_r(&now, &timeinfo);
-				
-				char time_str[64];
-				strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &timeinfo);
-				
-				ESP_LOGW("RTC_SYNC", "[⏰] ВНИМАНИЕ: Ручная корректировка времени! Установлено: %s", time_str);
-				ESP_LOGW("RTC_SYNC", "[🧹] RTC-RAM индекс сброшен для предотвращения наложения файлов.");
-				
-				// Можно отправить ответ в сокет:
-				// send(sock, "TIME_OK", 7, 0);
-			}
-        } else if (rx_len == 4) {
-            int32_t rx_index = -1; 
-			memcpy(&rx_index, rx_buf, 4); 
-			server_requested_index = rx_index;
         }
     }
     close(sock);
@@ -852,6 +856,13 @@ void app_main(void)
             esp_vfs_fat_sdcard_unmount(MOUNT_POINT, global_card_handle); 
         }
     }
+	
+	//-----?????-----//Нужно ли это, ведь и так плата перезапустится
+	if (ota_requested) {
+		ESP_LOGW(TAG, "[🚀] Карта очищена, флаги зафиксированы. Перезапускаемся на новую прошивку!");
+		vTaskDelay(pdMS_TO_TICKS(500));
+		esp_restart(); // Гарантирует 100% запуск нового ПО!
+	}
 
     // --- ФИНАЛЬНЫЙ СИНХРОННЫЙ УХОД В СОН (БЕЗ МЕТОК) ---
     gpio_hold_en(GPIO_NUM_48); 
