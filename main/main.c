@@ -363,19 +363,56 @@ bool send_info()
 
         ESP_LOGI(TAG, "Получен сетевой пакет (%d байт): %s", rx_len, rx_buf);
 
-        // --- 1. ОБРАБОТКА КОМАНДЫ СИНХРОНИЗАЦИИ ВРЕМЕНИ ---
-        // Ищем подстроку "TIME:" в любой точке буфера
+		// --- 1. ОБРАБОТКА КОМАНДЫ СИНХРОНИЗАЦИИ ВРЕМЕНИ + ПЕРЕИМЕНОВАНИЕ ---
         char *time_ptr = strstr(rx_buf, "TIME:");
         if (time_ptr) {
             uint64_t timestamp_sec = 0;
             if (sscanf(time_ptr, "TIME:%llu", &timestamp_sec) == 1) {
+                
+                // ЗАПОМИНАЕМ СТАРЫЙ ИНДЕКС перед сбросом, чтобы найти наш только что снятый файл
+                int last_captured_index = rtc_saved_file_index;
+
                 struct timeval tv = { .tv_sec = timestamp_sec, .tv_usec = 0 };
                 settimeofday(&tv, NULL);
-                rtc_saved_file_index = 0; // Сброс индекса под новое время
+                rtc_saved_file_index = 0; // Сброс индекса для будущих сканирований
                 
+                // Получаем новое правильное время
                 time_t now; struct tm timeinfo; time(&now); localtime_r(&now, &timeinfo);
                 char time_str[64]; strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &timeinfo);
                 ESP_LOGW("RTC_SYNC", "[⏰] Ручная корректировка времени выполнена: %s", time_str);
+
+                // === ХАК ПЕРЕИМЕНОВАНИЯ СВЕЖЕГО КАДРА ===
+                // Если до коннекта был успешно записан кадр (last_captured_index > 0)
+                if (last_captured_index > 0) {
+                    char old_path[64];
+                    // Так как плата проснулась с нулевым временем, этот кадр записался как 1970 год!
+                    // В часах после старта обычно успевает пройти 0-5 секунд, закладываем маску 19700101_0000
+                    // Но чтобы не гадать секунды, мы можем использовать нашу функцию find_file_by_index!
+                    // ВНИМАНИЕ: временно подменяем g_file_ext на ".jpg" (или какой у тебя макрос), если это нужно
+                    
+                    if (find_file_by_index(last_captured_index, old_path, sizeof(old_path))) {
+                        // Проверяем, что найденный файл действительно "призрак из прошлого" (1970 год)
+                        if (strstr(old_path, "19700101") != NULL) {
+                            
+                            // Формируем для него новое, абсолютно правильное имя на основе только что полученного времени!
+                            char new_path[64];
+                            snprintf(new_path, sizeof(new_path), FILE_PATTERN, 
+                                     MOUNT_POINT,
+                                     (timeinfo.tm_year + 1900), (timeinfo.tm_mon + 1), timeinfo.tm_mday,
+                                     timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
+                                     last_captured_index);
+
+                            // Вызываем стандартную функцию файловой системы Си для переименования файла
+                            if (rename(old_path, new_path) == 0) {
+                                ESP_LOGW("RTC_SYNC", "[🎉 SUCCESS] Файл успешно переименован!");
+                                ESP_LOGW("RTC_SYNC", "  Было: %s", old_path);
+                                ESP_LOGW("RTC_SYNC", "  Стало: %s", new_path);
+                            } else {
+                                ESP_LOGE("RTC_SYNC", "[-] Не удалось переименовать файл 1970 года!");
+                            }
+                        }
+                    }
+                }
             }
         }
 
