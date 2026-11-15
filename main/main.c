@@ -372,7 +372,14 @@ bool send_info()
     uint32_t free_mb = global_card_handle ? get_sd_free_space_mb() : 0;
 
     // Пункт №3: Передаем hardware_errors_mask вместо индекса кадра в холостом пинге!
-    uint32_t header[5] = { hardware_errors_mask, 0, bat_mv, free_mb, rtc_saved_file_index };
+    uint32_t header[6] = { 
+		hardware_errors_mask,   // [0] маска аппаратных ошибок
+		0,                      // [1] зарезервировано
+		bat_mv,				    // [2] напряжение батареи (или ваш текущий параметр)
+		free_mb,			    // [3] свободное место на флешке
+		sleep_interval_sec,      // [5] текущий интервал сна в секундах!
+		rtc_saved_file_index	// [4] всего кадров на флешке
+	};
     if (send(sock, header, sizeof(header), 0) < 0) { close(sock); return false; }
 
 	char rx_buf[128] = {0};

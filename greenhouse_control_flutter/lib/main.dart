@@ -44,6 +44,7 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
   bool _otaMode = false;
   bool _syncTimeRequested = false; // Триггер ручной корректировки времени
   int? _newIntervalSeconds; // Новый интервал в секундах
+  int _currentIntervalSec = 600; // Текущий интервал, полученный с платы
   
   final TextEditingController _dialogController = TextEditingController();
 
@@ -152,6 +153,18 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
     return null;
   }
 
+  // Универсальный помощник: гарантированно дочитывает N байт из потока и удаляет их из буфера
+  Future<Uint8List?> _readExactBytes(
+      int count, List<int> buffer, StreamIterator<Uint8List> iterator) async {
+    while (buffer.length < count) {
+      if (!await iterator.moveNext()) return null;
+      buffer.addAll(iterator.current);
+    }
+    final result = Uint8List.fromList(buffer.sublist(0, count));
+    buffer.removeRange(0, count); // Сразу очищаем прочитанное!
+    return result;
+  }
+
   // ЛИНЕЙНЫЙ ДИСПЕТЧЕР С ПОШАГОВЫМ ОЖИДАНИЕМ БУФЕРА
   void _handleEsp32Connection(Socket client) async {
     client.timeout(const Duration(seconds: 15)); 
@@ -172,88 +185,71 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
       print("⏰ [FLUTTER] На проснувшуюся плату успешно отправлено точное время: $timeCommand");
     }
       
+    // Константы протокола (меняются только здесь!)
+    const int baseHeaderInts = 4; // 4 числа = 16 байт (базовый заголовок)
+    const int pingExtraInts  = 2; // +2 числа = 8 байт (индекс последнего кадра + интервал сна)
 
     try {
-      // Шаг 1: Сначала всегда читаем стандартные 16 байт заголовка
-      while (currentBuffer.length < 16) {
-        if (!await iterator.moveNext()) break;
-        currentBuffer.addAll(iterator.current);
-      }
+      // 1. Читаем базовый заголовок (4 числа uint32)
+      final baseBytes = await _readExactBytes(baseHeaderInts * 4, currentBuffer, iterator);
+      if (baseBytes == null) { await client.close(); iterator.cancel(); return; }
 
-      if (currentBuffer.length < 16) {
-        await client.close(); iterator.cancel(); return;
-      }
-
-      final bd = ByteData.sublistView(Uint8List.fromList(currentBuffer.sublist(0, 16)));
-      int imgIndex = bd.getUint32(0, Endian.little);
-      int imgSize = bd.getUint32(4, Endian.little);
-      int batMv = bd.getUint32(8, Endian.little);
-      int freeSpaceMb = bd.getUint32(12, Endian.little);
-
-      double batV = batMv / 1000.0;
-      int batPct = (((batV - 3.5) / (4.2 - 3.5)) * 100).clamp(0, 100).toInt();
-      double freeGb = freeSpaceMb / 1024.0;
+      // Превращаем сырые байты в массив чисел: header[0], header[1], header[2], header[3]
+      final header = baseBytes.buffer.asUint32List();
+      final int imgIndex    = header[0];
+      final int imgSize     = header[1];
+      final int batMv       = header[2];
+      final int freeSpaceMb = header[3];
 
       // =======================================================================
-      // СЦЕНАРИЙ А: Холостой пинг (ESP32 прислала нам 20 байт)
+      // СЦЕНАРИЙ А: Холостой пинг (imgSize == 0)
       // =======================================================================
       if (imgSize == 0) {
-        // ДОЧИТЫВАЕМ ЕЩЕ 4 БАЙТА (пятый элемент header[4] из ESP32)
-        while (currentBuffer.length < 20) {
-          if (!await iterator.moveNext()) break;
-          currentBuffer.addAll(iterator.current);
-        }
+        // Дочитываем хвост пинга (ещё 2 числа uint32)
+        final extraBytes = await _readExactBytes(pingExtraInts * 4, currentBuffer, iterator);
+        if (extraBytes == null) { await client.close(); iterator.cancel(); return; }
 
-        if (currentBuffer.length < 20) {
-          await client.close(); iterator.cancel(); return;
-        }
+        final extra = extraBytes.buffer.asUint32List();
+        final int boardIntervalSec    = extra[0]; // Пятое  число с платы (интервал сна)
+        final int lastSavedFrameIndex = extra[1]; // Шестое число с платы
 
-        // Парсим наше новое 5-е поле (смещение 16 байт от начала заголовка)
-        final extendedBd = ByteData.sublistView(Uint8List.fromList(currentBuffer.sublist(16, 20)));
-        int lastSavedFrameIndex = extendedBd.getUint32(0, Endian.little);
+        // Расчёт батареи и ошибок
+        double batV = batMv / 1000.0;
+        int batPct = (((batV - 3.5) / (4.2 - 3.5)) * 100).clamp(0, 100).toInt();
+        double freeGb = freeSpaceMb / 1024.0;
 
-        int errorMask = imgIndex; 
         String hardwareLog = "[OK] Железо платы исправно";
-        if (errorMask > 0) {
+        if (imgIndex > 0) {
           List<String> errorsList = [];
-          if ((errorMask & 0x01) != 0) errorsList.add("Сбой Инит Камеры");
-          if ((errorMask & 0x02) != 0) errorsList.add("Пустой кадр матрицы");
-          if ((errorMask & 0x04) != 0) errorsList.add("Карта SD неисправна");
+          if ((imgIndex & 0x01) != 0) errorsList.add("Сбой Инит Камеры");
+          if ((imgIndex & 0x02) != 0) errorsList.add("Пустой кадр матрицы");
+          if ((imgIndex & 0x04) != 0) errorsList.add("Карта SD неисправна");
           hardwareLog = "[Авария]: ${errorsList.join(', ')}";
         }
 
-        String storageStr = freeSpaceMb > 0 ? "Карта: ${freeGb.toStringAsFixed(2)} ГБ свободно" : "Карта: Неисправна или Отформатирована";
-        
-        // Переменная для вывода информации о количестве кадров на экране смартфона
-        String frameCounterStr = "Всего кадров в теплице: $lastSavedFrameIndex";
-
-        // Узнаем, сколько у нас уже скачано локально
         int maxSavedIdx = await get_max_saved_index();
 
         setState(() {
-          _queueText = hardwareLog; 
+          _queueText = hardwareLog;
           _batteryText = batMv > 0 ? "Батарея: ${batV.toStringAsFixed(2)} V ($batPct%)" : "Батарея: USB";
-          _statusText = storageStr;
-          
-          // Сохраняем значения в глобальные переменные состояния класса!
+          _statusText = freeSpaceMb > 0 ? "Карта: ${freeGb.toStringAsFixed(2)} ГБ свободно" : "Карта: Неисправна или Отформатирована";
           _totalFramesOnBoard = lastSavedFrameIndex;
-          _localFramesCount = maxSavedIdx; 
+          _localFramesCount = maxSavedIdx;
+          if (boardIntervalSec > 0) _currentIntervalSec = boardIntervalSec;
         });
 
-        // === НАШ НОВЫЙ БЛОК МНОЖЕСТВЕННОЙ ОТПРАВКИ КОМАНД ===
-        // === НАШ ПРАВИЛЬНЫЙ И БЕЗОПАСНЫЙ ПОРЯДОК ОТПРАВКИ КОМАНД ===
+        // --- Очередь ручных команд (строго по приоритету) ---
         bool commandSent = false;
 
         // Приоритет №1: Время
         if (_syncTimeRequested) {
-          final int currentUnixTime = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-          final String timeCommand = "TIME:$currentUnixTime";
-          client.add(Uint8List.fromList(timeCommand.codeUnits));
+          final unixSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+          client.add(Uint8List.fromList("TIME:$unixSec".codeUnits));
           await client.flush();
           _syncTimeRequested = false;
           commandSent = true;
-          print("⏰ [FLUTTER] Отправлено время: $timeCommand");
-          await Future.delayed(const Duration(milliseconds: 50)); 
+          print("⏰ [FLUTTER] Отправлено время: TIME:$unixSec");
+          await Future.delayed(const Duration(milliseconds: 50));
         }
 
         // Приоритет №2: Форматирование SD
@@ -268,117 +264,117 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
 
         // Приоритет №2.5: Изменение интервала съёмки (в секундах)
         if (_newIntervalSeconds != null) {
-          final String intCommand = "INT:$_newIntervalSeconds";
-          client.add(Uint8List.fromList(intCommand.codeUnits));
-          await client.flush();
+          final int sentInterval = _newIntervalSeconds!; // Запоминаем новое значение
           
-          _newIntervalSeconds = null; 
+          client.add(Uint8List.fromList("INT:$sentInterval".codeUnits));
+          await client.flush();
+          print("⏱️ [FLUTTER] Отправлен новый интервал: INT:$sentInterval");
+          
+          setState(() {
+            _currentIntervalSec = sentInterval; // Мгновенно обновляем цифру на экране!
+            _newIntervalSeconds = null;         // Сбрасываем отложенную команду
+          });
+          
           commandSent = true;
-          print("⏱️ [FLUTTER] Отправлен новый интервал: $intCommand");
           await Future.delayed(const Duration(milliseconds: 50));
         }
 
-        // Приоритет №3: Обновление прошивки
+        // Приоритет №3: Обновление прошивки (строго последней!)
         if (_otaMode) {
-          // ... твой код отправки прошивки OTA (без изменений) ...
-          // otaMode тоже взведет commandSent = true после успешной отправки бинарника
-        }
-
-        // ПОДВЕДЕНИЕ ИТОГОВ РАБОТЫ С СЕРВИСНЫМИ ФЛАГАМИ:
-        if (commandSent) {
-          // ХАК ДЛЯ ПРЕДОТВРАЩЕНИЯ СЛИВА ВСЕХ ФАЙЛОВ:
-          // Даже если мы отправили команды, мы ОБЯЗАНЫ передать плате наш максимальный индекс,
-          // чтобы она знала актуальную точку остановки архива и не слала старье!
-          int maxSavedIdx = await get_max_saved_index();
-          final resp = ByteData(4)..setInt32(0, maxSavedIdx, Endian.little);
-          
-          client.add(resp.buffer.asUint8List()); // Досылаем 4 байта индекса «прицепом» [INDEX]
-          await client.flush();
-          
-          setState(() { _statusText = "Все команды успешно переданы на плату!"; });
-          await client.close(); 
-          iterator.cancel(); 
-          return;
-        }
-
-        // Базовый режим синхронизации картинок (выполняется, только если ручных флагов не было)
-        maxSavedIdx = await get_max_saved_index();
-        final resp = ByteData(4)..setInt32(0, maxSavedIdx, Endian.little);
-        client.add(resp.buffer.asUint8List());
-        await client.flush(); await client.close(); iterator.cancel(); return;        
-        
-      }
-
-      // =======================================================================
-      // СЦЕНАРИЙ Б: Прием файла (16 байт хедера -> Имя файла -> Тело JPEG)
-      // =======================================================================
-      if (currentBuffer.length >= 16) {
-        // 1. ЧИТАЕМ СТРОГО 16 БАЙТ ХЕДЕРА
-        final headerBytes = currentBuffer.sublist(0, 16);
-        final headerData = ByteData.view(Uint8List.fromList(headerBytes).buffer);
-        
-        final int actualImgIndex = headerData.getUint32(0, Endian.little);
-        final int actualImgSize = headerData.getUint32(4, Endian.little);
-        final int nameLen = headerData.getUint32(8, Endian.little); // Длина имени!
-
-        // Ждем, пока в буфер долетит всё остальное (имя файла + сам JPEG)
-        // Общий размер данных в этой сессии: 16 (хедер) + длина имени + размер картинки
-        int totalExpectedBytes = 16 + nameLen + actualImgSize;
-        
-        while (currentBuffer.length < totalExpectedBytes) {
-          if (!await iterator.moveNext()) break;
-          currentBuffer.addAll(iterator.current);
-        }
-
-        // 2. ВЫРЕЗАЕМ ИМЯ ФАЙЛА (оно идет строго после 16-ти байт хедера)
-        final nameBytes = currentBuffer.sublist(16, 16 + nameLen);
-        String originalFileName = String.fromCharCodes(nameBytes).trim();
-
-        if (originalFileName.isEmpty) {
-          originalFileName = "${actualImgIndex.toString().padLeft(5, '0')}.jpg";
-        }
-
-        // 3. ВЫРЕЗАЕМ ТЕЛО JPEG (оно идет строго после хедера и имени файла)
-        final int jpegStartOffset = 16 + nameLen;
-        final jpegBytes = Uint8List.fromList(
-          currentBuffer.sublist(jpegStartOffset, jpegStartOffset + actualImgSize)
-        );
-
-        // 4. ЗАПИСЫВАЕМ НА ДИСК ПОД ОРИГИНАЛЬНЫМ ИМЕНЕМ
-        try {
           final extDir = await getExternalStorageDirectory();
           if (extDir != null) {
-            final greenhouseFolder = Directory('${extDir.path}/greenhouse_archive');
-            if (!greenhouseFolder.existsSync()) greenhouseFolder.createSync(recursive: true);
-            
-            final file = File('${greenhouseFolder.path}/$originalFileName');
-            await file.writeAsBytes(jpegBytes); 
+            final otaFile = File('${extDir.path}/firmware.bin');
+            if (otaFile.existsSync()) {
+              int otaSize = otaFile.lengthSync();
+              client.add(Uint8List.fromList("OTA:$otaSize".codeUnits));
+              await client.flush();
 
-            // === НАШ НОВЫЙ БЛОК КОРРЕКТИРОВКИ СИСТЕМНОГО ВРЕМЕНИ ФАЙЛА ===
-            final fileDateTime = _parseDateTimeFromFileName(originalFileName);
-            if (fileDateTime != null) {
-              // Насильно выставляем операционной системе телефона время изменения файла!
-              await file.setLastModified(fileDateTime);
-              print("⏰ [FLUTTER] Системное время файла обновлено на: $fileDateTime");
+              // currentBuffer уже очищен от заголовка функцией _readExactBytes,
+              // поэтому сразу ждем байты ответа "READY" (82='R', 89='Y')
+              while (!currentBuffer.contains(82) || !currentBuffer.contains(89)) {
+                if (!await iterator.moveNext()) break;
+                currentBuffer.addAll(iterator.current);
+              }
+              setState(() { _statusText = "Передача прошивки по воздуху..."; });
+              final binaryBytes = otaFile.readAsBytesSync();
+              client.add(binaryBytes);
+              await client.flush();
+              _otaMode = false;
+              commandSent = true;
+              print("🚀 [FLUTTER] Отправлен бинарник OTA прошивки.");
+            } else {
+              setState(() {
+                _statusText = "Ошибка: Файл firmware.bin не найден в папке приложения!";
+                _otaMode = false;
+              });
             }
           }
-        } catch (e) { print("Ошибка записи файла: $e"); }
+        }
 
-        // Обновляем интерфейс приложения
-        setState(() {
-          _jpegBytes = jpegBytes;
-          _statusText = "Скачан кадр: $originalFileName";
-          _localFramesCount = actualImgIndex; 
-        });
-        
-        // Отправляем плате подтверждение ACK по реальному индексу кадра
-        final ack = ByteData(4)..setInt32(0, actualImgIndex, Endian.little);
-        client.add(ack.buffer.asUint8List());
-        await client.flush(); 
-        await client.close(); 
+        // Всегда отправляем в конце актуальный индекс локального архива (1 число uint32)
+        maxSavedIdx = await get_max_saved_index();
+        final resp = Uint32List.fromList([maxSavedIdx]);
+        client.add(resp.buffer.asUint8List());
+        await client.flush();
+
+        if (commandSent) {
+          setState(() { _statusText = "Все команды успешно переданы на плату!"; });
+        }
+
+        await client.close();
         iterator.cancel();
         return;
       }
+
+      // =======================================================================
+      // СЦЕНАРИЙ Б: Прием файла (imgSize > 0)
+      // =======================================================================
+      // В базовом заголовке для файла третье поле (header[2]) — это длина имени файла!
+      final int nameLen = header[2];
+
+      // 1. Читаем имя файла
+      final nameBytes = await _readExactBytes(nameLen, currentBuffer, iterator);
+      String originalFileName = nameBytes != null ? String.fromCharCodes(nameBytes).trim() : "";
+      if (originalFileName.isEmpty) {
+        originalFileName = "${imgIndex.toString().padLeft(5, '0')}.jpg";
+      }
+
+      // 2. Читаем само тело JPEG
+      final jpegBytes = await _readExactBytes(imgSize, currentBuffer, iterator);
+      if (jpegBytes == null) { await client.close(); iterator.cancel(); return; }
+
+      // 3. Сохраняем на диск и выставляем дату из имени файла
+      try {
+        final extDir = await getExternalStorageDirectory();
+        if (extDir != null) {
+          final greenhouseFolder = Directory('${extDir.path}/greenhouse_archive');
+          if (!greenhouseFolder.existsSync()) greenhouseFolder.createSync(recursive: true);
+
+          final file = File('${greenhouseFolder.path}/$originalFileName');
+          await file.writeAsBytes(jpegBytes);
+
+          final fileDateTime = _parseDateTimeFromFileName(originalFileName);
+          if (fileDateTime != null) {
+            await file.setLastModified(fileDateTime);
+            print("⏰ [FLUTTER] Системное время файла обновлено на: $fileDateTime");
+          }
+        }
+      } catch (e) { print("Ошибка записи файла: $e"); }
+
+      // 4. Обновляем интерфейс приложения
+      setState(() {
+        _jpegBytes = jpegBytes;
+        _statusText = "Скачан кадр: $originalFileName";
+        _localFramesCount = imgIndex;
+      });
+
+      // 5. Отправляем плате подтверждение ACK по индексу кадра
+      final ack = Uint32List.fromList([imgIndex]);
+      client.add(ack.buffer.asUint8List());
+      await client.flush();
+      await client.close();
+      iterator.cancel();
+      return;
 
     } catch (e) {
       setState(() { _statusText = "Сбой сессии: $e"; });
@@ -500,109 +496,112 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
   }
 
 @override
-Widget build(BuildContext context) {
-  // Вычисляем, сколько кадров осталось скачать
-  int framesLeft = _totalFramesOnBoard - _localFramesCount;
-  if (framesLeft < 0) framesLeft = 0;
+  Widget build(BuildContext context) {
+    // Вычисляем, сколько кадров осталось скачать
+    int framesLeft = _totalFramesOnBoard - _localFramesCount;
+    if (framesLeft < 0) framesLeft = 0;
 
-  final TextEditingController _commandController = TextEditingController();
+    final TextEditingController _commandController = TextEditingController();
 
-  return Scaffold(
-    appBar: AppBar(title: const Text('Greenhouse Control Пульт')),
-    body: Padding(
-      padding: const EdgeInsets.all(12.0),
-      child: Column(
-        children: [
-          Expanded(
-            child: Container(
-              width: double.infinity,
-              decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(8)),
-              child: _jpegBytes != null
-                  ? Image.memory(_jpegBytes!, fit: BoxFit.contain)
-                  : const Center(child: Text("Ожидание теплицы...", style: TextStyle(color: Colors.grey))),
+    return Scaffold(
+      appBar: AppBar(title: const Text('Greenhouse Control Пульт')),
+      body: Padding(
+        padding: const EdgeInsets.all(12.0),
+        child: Column(
+          children: [
+            Expanded(
+              child: Container(
+                width: double.infinity,
+                decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(8)),
+                child: _jpegBytes != null
+                    ? Image.memory(_jpegBytes!, fit: BoxFit.contain)
+                    : const Center(child: Text("Ожидание теплицы...", style: TextStyle(color: Colors.grey))),
+              ),
             ),
-          ),
-          const SizedBox(height: 15),
-          Text(_statusText, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold), textAlign: TextAlign.center),
-          const SizedBox(height: 5),
-          Text(_queueText, style: TextStyle(fontSize: 15, color: _queueText.contains("Авария") ? Colors.redAccent : Colors.white70, fontWeight: _queueText.contains("Аvaрия") ? FontWeight.bold : FontWeight.normal)),
-          const SizedBox(height: 5),
-          Text(_batteryText, style: const TextStyle(fontSize: 15, color: Colors.greenAccent)),
-          
-          // =======================================================================
-          // НАШ НОВЫЙ БЛОК: ИНДИКАТОР ОЧЕРЕДИ СКАЧИВАНИЯ КАДРОВ
-          // =======================================================================
-          const SizedBox(height: 10),
-          Container(
-            padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
-            decoration: BoxDecoration(
-              color: framesLeft > 0 ? Colors.blue.withOpacity(0.1) : Colors.green.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(6),
+            Text( "⏱️ Интервал съёмки: $_currentIntervalSec сек. (${(_currentIntervalSec / 60).toStringAsFixed(1)} мин.)",
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
             ),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  framesLeft > 0 ? "Осталось скачать: $framesLeft кадров" : "Синхронизировано",
-                  style: TextStyle(
-                    fontSize: 14, 
-                    fontWeight: FontWeight.bold, 
-                    color: framesLeft > 0 ? Colors.blue : Colors.greenAccent
+            const SizedBox(height: 15),
+            Text(_statusText, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold), textAlign: TextAlign.center),
+            const SizedBox(height: 5),
+            Text(_queueText, style: TextStyle(fontSize: 15, color: _queueText.contains("Авария") ? Colors.redAccent : Colors.white70, fontWeight: _queueText.contains("Аvaрия") ? FontWeight.bold : FontWeight.normal)),
+            const SizedBox(height: 5),
+            Text(_batteryText, style: const TextStyle(fontSize: 15, color: Colors.greenAccent)),
+            
+            // =======================================================================
+            // НАШ НОВЫЙ БЛОК: ИНДИКАТОР ОЧЕРЕДИ СКАЧИВАНИЯ КАДРОВ
+            // =======================================================================
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+              decoration: BoxDecoration(
+                color: framesLeft > 0 ? Colors.blue.withOpacity(0.1) : Colors.green.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    framesLeft > 0 ? "Осталось скачать: $framesLeft кадров" : "Синхронизировано",
+                    style: TextStyle(
+                      fontSize: 14, 
+                      fontWeight: FontWeight.bold, 
+                      color: framesLeft > 0 ? Colors.blue : Colors.greenAccent
+                    ),
                   ),
-                ),
-                Text(
-                  "$_localFramesCount из $_totalFramesOnBoard",
-                  style: const TextStyle(fontSize: 14, color: Colors.grey),
-                ),
-              ],
+                  Text(
+                    "$_localFramesCount из $_totalFramesOnBoard",
+                    style: const TextStyle(fontSize: 14, color: Colors.grey),
+                  ),
+                ],
+              ),
             ),
-          ),
-          // =======================================================================
+            // =======================================================================
 
-          Padding(
-            padding: const EdgeInsets.all(8.0),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _commandController,
-                    // Указываем тип действия для кнопки клавиатуры — "Отправить"
-                    textInputAction: TextInputAction.send, 
-                    // ХАК №1: Отправка и скрытие клавиатуры при нажатии на Enter/галочку самой клавиатуры!
-                    onSubmitted: (value) {
-                      final cmd = value.trim();
+            Padding(
+              padding: const EdgeInsets.all(8.0),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _commandController,
+                      // Указываем тип действия для кнопки клавиатуры — "Отправить"
+                      textInputAction: TextInputAction.send, 
+                      // ХАК №1: Отправка и скрытие клавиатуры при нажатии на Enter/галочку самой клавиатуры!
+                      onSubmitted: (value) {
+                        final cmd = value.trim();
+                        if (cmd.isNotEmpty) {
+                          _sendManualCommand(cmd);
+                          _commandController.clear();
+                        }
+                        // ХАК №2: Убираем фокус с поля, принудительно пряча клавиатуру!
+                        FocusScope.of(context).unfocus();
+                      },
+                      decoration: const InputDecoration(
+                        labelText: 'Введите команду (например, SET_TIME)',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    icon: const Icon(Icons.send),
+                    onPressed: () {
+                      final cmd = _commandController.text.trim();
                       if (cmd.isNotEmpty) {
                         _sendManualCommand(cmd);
                         _commandController.clear();
                       }
-                      // ХАК №2: Убираем фокус с поля, принудительно пряча клавиатуру!
+                      // Прячем клавиатуру и при нажатии на обычную кнопку-иконку на экране!
                       FocusScope.of(context).unfocus();
                     },
-                    decoration: const InputDecoration(
-                      labelText: 'Введите команду (например, SET_TIME)',
-                      border: OutlineInputBorder(),
-                    ),
                   ),
-                ),
-                const SizedBox(width: 8),
-                IconButton(
-                  icon: const Icon(Icons.send),
-                  onPressed: () {
-                    final cmd = _commandController.text.trim();
-                    if (cmd.isNotEmpty) {
-                      _sendManualCommand(cmd);
-                      _commandController.clear();
-                    }
-                    // Прячем клавиатуру и при нажатии на обычную кнопку-иконку на экране!
-                    FocusScope.of(context).unfocus();
-                  },
-                ),
-              ],
-            ),
-          )
-        ],
+                ],
+              ),
+            )
+          ],
+        ),
       ),
-    ),
-  );
-}
+    );
+  }
 }
