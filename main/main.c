@@ -28,7 +28,6 @@
 
 #include <esp_log.h>
 #include <esp_system.h>
-#include <nvs_flash.h>
 #include <sys/param.h>
 #include <string.h>
 
@@ -98,6 +97,7 @@ RTC_DATA_ATTR static int rtc_saved_file_index = 0; // Текущий индек�
 static uint64_t session_start_us;
 static bool ota_requested = false; // Отложенный перезапуск после обновления ПО
 static bool photo_saved_this_boot = false; //Флаг того, что кадр был снят в этой сессии, а не когда либо раньше.
+static uint32_t sleep_interval_sec = TARGET_PERIOD_SEC;
 
 static char g_dir_path[64]; // Сюда автоматически запишется "/sdcard/photos"
 static char g_file_ext[8];  // Сюда автоматически запишется ".jpg" (или ".raw")
@@ -339,6 +339,30 @@ bool find_file_by_index(int index, char *out_path, size_t max_len)
     return found;
 }
 
+// Чтение интервала в секундах из NVS (если не задан — вернёт TARGET_PERIOD_SEC)
+uint32_t load_sleep_interval_sec(void) 
+{
+    nvs_handle_t my_handle;
+    uint32_t interval = TARGET_PERIOD_SEC; 
+    if (nvs_open("storage", NVS_READONLY, &my_handle) == ESP_OK) {
+        nvs_get_u32(my_handle, "sleep_sec", &interval);
+        nvs_close(my_handle);
+    }
+    return interval;
+}
+
+// Запись нового интервала (в секундах) во флеш-память
+void save_sleep_interval_sec(uint32_t new_interval) 
+{
+    nvs_handle_t my_handle;
+    if (nvs_open("storage", NVS_READWRITE, &my_handle) == ESP_OK) {
+        nvs_set_u32(my_handle, "sleep_sec", new_interval);
+        nvs_commit(my_handle);
+        nvs_close(my_handle);
+        ESP_LOGW("NVS_CFG", "[💾] Новый интервал (%lu сек.) сохранён во флеш-память!", new_interval);
+    }
+}
+
 bool send_info() 
 {
     int sock = create_connected_socket();
@@ -363,6 +387,19 @@ bool send_info()
         }
 
         ESP_LOGI(TAG, "Получен сетевой пакет (%d байт): %s", rx_len, rx_buf);
+
+		// --- 0. Обработка команды изменения интервала съемки --- 
+		char *int_ptr = strstr(rx_buf, "INT:");
+		if (int_ptr) {
+			uint32_t new_sec = 0;
+			// Защита: от 5 секунд до 604800 секунд (1 неделя)
+			if (sscanf(int_ptr, "INT:%lu", &new_sec) == 1 && new_sec >= 15 && new_sec <= 604800) {
+				save_sleep_interval_sec(new_sec);
+				sleep_interval_sec = new_sec; // Применяем сразу для текущего сна
+			} else {
+				ESP_LOGE("NVS_CFG", "[-] Некорректный интервал! Допустимо от 5 до 604800 сек.");
+			}
+		}
 
 		// --- 1. ОБРАБОТКА КОМАНДЫ СИНХРОНИЗАЦИИ ВРЕМЕНИ + ПЕРЕИМЕНОВАНИЕ ---
         char *time_ptr = strstr(rx_buf, "TIME:");
@@ -501,7 +538,7 @@ camera_fb_t *take_photo(void)
 	ESP_LOGW(TAG, "[*] Запуск безопасного цикла захвата кадра...");
 	int attempt = 0;
 	uint64_t total_elapsed_sec = (esp_timer_get_time() - session_start_us) / 1000000ULL;
-	while (total_elapsed_sec <= (TARGET_PERIOD_SEC - 20)) {
+	while (total_elapsed_sec <= (sleep_interval_sec - 5)) {
 		attempt++;
 
 		// === ШАГ 2: ЗАХВАТ КАДРА ===
@@ -717,6 +754,9 @@ void app_main(void)
     }
     ESP_ERROR_CHECK( ret );
 
+	sleep_interval_sec = load_sleep_interval_sec();
+	ESP_LOGI(TAG, "Текущий интервал просыпания: %lu сек.", sleep_interval_sec);
+
 	init_file_system_paths(); //Файловые пути и паттерны
 
 	uint32_t wakeup_mask = esp_sleep_get_wakeup_causes();
@@ -809,7 +849,7 @@ void app_main(void)
 				bool mode_change = true;
 				for (int i = last_sent_index + 1; i <= boot_count; i++) {
 					uint64_t total_elapsed_sec = (esp_timer_get_time() - session_start_us) / 1000000ULL;
-					if (total_elapsed_sec >= (TARGET_PERIOD_SEC - 20)) { 
+					if (total_elapsed_sec >= (sleep_interval_sec - 5)) { 
 						ESP_LOGE(TAG, "Динамический таймер прервал очередь сессии.");
 						mode_change = false;
 						break; 
@@ -879,7 +919,6 @@ void app_main(void)
         }
     }
 	
-	//-----?????-----//Нужно ли это, ведь и так плата перезапустится
 	if (ota_requested) {
 		ESP_LOGW(TAG, "[🚀] Карта очищена, флаги зафиксированы. Перезапускаемся на новую прошивку!");
 		vTaskDelay(pdMS_TO_TICKS(500));
@@ -897,8 +936,11 @@ void app_main(void)
     rtc_gpio_pulldown_dis(0);
 
     int elapsed_sec = (int)((esp_timer_get_time() - session_start_us) / 1000000ULL);
-    int sleep_time_sec = TARGET_PERIOD_SEC - elapsed_sec;
-    if (sleep_time_sec < 15) sleep_time_sec = 15;
+    int sleep_time_sec = sleep_interval_sec - elapsed_sec;
+
+	//???
+    if (sleep_time_sec < 5) sleep_time_sec = 5;
+	// Это может мешать при малых sleep_interval_sec
 
     ESP_LOGW(TAG, "Ухожу в глубокий сон на %d сек.", sleep_time_sec);
     esp_sleep_enable_timer_wakeup((uint64_t)sleep_time_sec * 1000000LL);

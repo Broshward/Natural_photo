@@ -43,6 +43,7 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
   bool _formatRequested = false;
   bool _otaMode = false;
   bool _syncTimeRequested = false; // Триггер ручной корректировки времени
+  int? _newIntervalSeconds; // Новый интервал в секундах
   
   final TextEditingController _dialogController = TextEditingController();
 
@@ -265,6 +266,18 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
           await Future.delayed(const Duration(milliseconds: 50));
         }
 
+        // Приоритет №2.5: Изменение интервала съёмки (в секундах)
+        if (_newIntervalSeconds != null) {
+          final String intCommand = "INT:$_newIntervalSeconds";
+          client.add(Uint8List.fromList(intCommand.codeUnits));
+          await client.flush();
+          
+          _newIntervalSeconds = null; 
+          commandSent = true;
+          print("⏱️ [FLUTTER] Отправлен новый интервал: $intCommand");
+          await Future.delayed(const Duration(milliseconds: 50));
+        }
+
         // Приоритет №3: Обновление прошивки
         if (_otaMode) {
           // ... твой код отправки прошивки OTA (без изменений) ...
@@ -465,6 +478,18 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
         _statusText = "🚀 Режим OTA отложен до подключения платы...";
       });
       print("🚀 [FLUTTER] Режим OTA взведен.");
+    } else if (upperCmd.startsWith('INT:')) {
+      final val = int.tryParse(upperCmd.substring(4));
+      if (val != null && val >= 5 && val <= 604800) {
+        setState(() {
+          _newIntervalSeconds = val;
+          _statusText = "⏱️ Интервал $val сек. отложен до подключения...";
+        });
+      } else {
+        setState(() {
+          _statusText = "❌ Ошибка: укажите от 5 до 604800 сек (пример: INT:600)";
+        });
+      }
     } else {
       // ЕСЛИ КОМАНДА НЕ РАСПОЗНАНА:
       setState(() {
