@@ -1,0 +1,1 @@
+for i in `adb shell ls /sdcard/Android/data/com.example.greenhouse_control_flutter/files/greenhouse_archive/`; do adb pull /sdcard/Android/data/com.example.greenhouse_control_flutter/files/greenhouse_archive/$i greenhouse_images/; done
