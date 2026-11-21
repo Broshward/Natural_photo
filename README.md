@@ -1,100 +1,102 @@
-# Autonomous low-power timelapse camera on ESP32-S3 for natural videos
+# Autonomous Low-Power 5MP Timelapse Camera on ESP32-S3
 
-An automated, ultra-low-power greenhouse monitoring camera system built from scratch using pure C and **ESP-IDF v6.x**. The system wakes up periodically, captures photos, buffers them on an SD card in case of connectivity issues, and bulk-transfers the queue via TCP sockets to a remote server.
+An automated, ultra-low-power greenhouse and wildlife monitoring camera system built from scratch using pure C and **ESP-IDF v6.x**. The system wakes up periodically, captures native 5-megapixel JPEG frames, filters out dark/night shots via on-the-fly prescaled decoding, buffers valid photos on a MicroSD card, and syncs the archive via TCP sockets to a companion Flutter mobile/desktop app.
 
-## Architectural Features
-* **Dynamic Sleep Timing:** The microelectronic wake-up and transfer cycle auto-calculates execution overhead. If a bulk transmission takes 3 minutes, the deep sleep duration shrinks by 3 minutes to guarantee exact 10-minute snapshot intervals.
-* **Non-Stop History Flushing:** When a network link is established, the MCU stream-transfers the backed-up photos without going to sleep. If a new scheduled snapshot time arrives mid-transfer, it pauses for a second, takes a fresh photo, commits it to the SD card, and resumes the transfer stream.
-* **Crash-Proof Indexing:** The last successfully transmitted file index is persistently cached into a micro-text file on the SD card (`last_sent.txt`). This prevents queue duplicates or loss of progress even after panic reboots, watchdog triggers, or total power loss.
-* **Low-Cost Buffer Power Architecture:** Designed to work with a standard 18650 Li-ion battery coupled with a cheap TP4056 charger and an MT3608 boost converter. Hardware components are split sequentially in code to prevent concurrent Wi-Fi modem and SD card peak currents from sagging the LDO regulator voltage.
+## Architectural & Software Features
+
+* **Native 5MP JPEG Pipeline:** Captures high-resolution `2560x1920` hardware-compressed JPEG frames directly into 8MB Octal PSRAM, eliminating heavy raw YUV422 transfers and external color conversion overhead.
+* **Smart Night/Darkness Filtering (`esp_jpeg`):** Uses prescaled software JPEG decoding (`1/8` scale into internal RAM) to calculate true average pixel luminance (`Y` channel), preventing high-gain sensor noise in the dark from wasting SD storage and battery.
+* **Timestamped File Naming & Auto-Sync:** Files are stored using the `YYYYMMDD_HHMMSS_INDEX.jpg` pattern. When time is synchronized via the mobile app, the firmware automatically renames the freshly captured pre-sync frame and updates file modification timestamps (`mtime`) on the smartphone for accurate gallery sorting.
+* **Persistent NVS Configuration:** Snapshot intervals (in seconds, from `5s` up to `7 days`) are stored in the ESP32-S3 Non-Volatile Storage (NVS), surviving deep sleep, resets, and battery swaps.
+* **Hardware Mode Jumper (`GPIO 42` + `GPIO 2`):** Supports instant hardware switching between standalone wildlife mode (button-triggered wakeup) and continuous greenhouse mode (automatic capture + Wi-Fi sync on every wakeup) without reflashing.
+* **Dynamic Sleep Timing & Safe SD Handling:** Auto-calculates execution and transfer overhead to maintain exact snapshot intervals. The SD card is mounted strictly for I/O and immediately unmounted before deep sleep to prevent FAT32 corruption.
+* **Offline-Ready Build Architecture:** Core dependencies (`esp32-camera` and `esp_jpeg`) are vendored locally in `components/`, allowing instant compilation without external registry access (`IDF_COMPONENT_MANAGER=0`).
+
+## Operating Modes
+
+| Mode | Trigger Condition | Behavior |
+| :--- | :--- | :--- |
+| **Mode 0 (Wildlife Timer)** | Timer wakeup (No jumper) | Captures photo, checks brightness, saves to SD, enters Deep Sleep. Wi-Fi stays off to maximize battery life. |
+| **Mode 1 (Live Preview)** | Short press `GPIO 0` (No jumper) | Captures a live frame and streams it directly to the app (`live_preview.jpg`) without saving to SD. Used for manual lens focusing. |
+| **Mode 2 (Archive Sync)** | Long press `GPIO 0` (No jumper) | Skips capture, connects to Wi-Fi, and bulk-transfers all missing photos from SD to the smartphone. |
+| **Mode 3 (Greenhouse)** | Hardware jumper on `GPIO 42`–`GPIO 2` | Captures photo, saves to SD, connects to Wi-Fi, syncs new frames, executes queued remote commands, and sleeps. |
 
 ## Hardware Specifications
+
 * **MCU Board:** ESP32-S3 WROOM N16R8 (Freenove V1695 / Dual Type-C revision).
-* **RAM:** 8MB Octal SPI PSRAM (Required for high-resolution DMA frame allocation).
-* **Camera Sensor:** OmniVision **OV5640** (DVP 24-pin flat cable with manual focus ring).
-* **Storage:** MicroSD card formatted in FAT32 (1-bit SDMMC bus wiring mode).
-* **Status Indication:** On-board WS2812B RGB LED on GPIO48 (Hard-locked to ground during deep sleep to prevent battery drain).
+* **RAM:** 8MB Octal SPI PSRAM (80MHz).
+* **Camera Sensor:** OmniVision **OV5640** (24-pin DVP interface with manual focus lens).
+* **Storage:** MicroSD card formatted in FAT32 (1-bit SDMMC bus: `CLK=39`, `CMD=38`, `D0=40`).
+* **Mode Jumper:** Standard 2.54mm jumper across `GPIO 42` (driven low during check) and `GPIO 2` (internal pull-up), completely floating during deep sleep to prevent current leakage.
+* **Power Architecture:** Single 18650 Li-ion cell with TP4056 charger and MT3608 boost converter, with sequential peripheral initialization to prevent LDO brownouts.
 
 ## Repository Structure
+
 ```text
 .
-├── .gitignore               # Excludes large build objects and local sdkconfigs
-├── CMakeLists.txt           # Top-level project CMake configuration
-├── README.md                # Project documentation
-└── main/
-    ├── CMakeLists.txt       # Main component build manifest
-    ├── idf_component.yml    # Auto-managed toolchain dependencies
-    └── main.c               # Core firmware implementation in pure C
+├── .gitignore                   # Excludes build artifacts, caches, and unused platforms
+├── CMakeLists.txt               # Top-level ESP-IDF project configuration
+├── README.md                    # Project documentation
+├── components/                  # Vendored local components for offline builds
+│   ├── esp32-camera/            # OV5640 DVP camera driver
+│   └── esp_jpeg/                # Software JPEG decoder for brightness analysis
+├── main/
+│   ├── CMakeLists.txt           # Main component manifest
+│   └── main.c                   # Core firmware implementation in pure C
+└── greenhouse_control_flutter/  # Cross-platform Flutter control app (Android & Linux)
+    ├── lib/main.dart            # TCP socket server, binary protocol parser & UI
+    ├── android/                 # Android Gradle configs and permissions
+    └── linux/                   # Linux desktop build files
 ```
 
-## How to Build and Flash
+## How to Build and Flash Firmware
 
-1. Clone this repository to your Linux build workstation:
+1. Clone the repository and enter the project directory:
    ```bash
-   git clone --recursive https://github.com
-   cd YOUR_REPO_NAME
+   git clone https://github.com
+   cd Natural_photo
    ```
 
-2. Export the ESP-IDF toolchain environment path (v5.x branch required):
+2. Export the ESP-IDF toolchain environment (v6.x) and disable online component checks:
    ```bash
    . /opt/esp-idf/export.sh
+   export IDF_COMPONENT_MANAGER=0
    ```
 
-3. Set the compilation target platform architecture to ESP32-S3:
+3. Configure target and partition table (required for OTA support):
    ```bash
    idf.py set-target esp32s3
-   ```
-
-4. Open the visual configuration menu to force **Octal Mode PSRAM** instantiation:
-   ```bash
    idf.py menuconfig
    ```
-   * Navigate to: `Component config` -> `ESP32S3-Specific`.
-   * Enable `Support for external, SPI-connected RAM`.
-   * Under `SPI RAM config`, verify that `Type of SmartMemory/PSRAM connected` is explicitly set to **`Octal Mode PSRAM`** and clock speed is clocked to **`80MHz`**.
-   * Set allocation strategy to `Make RAM allocatable using heap_caps_malloc()`.
+   * **Octal PSRAM:** `Component config` -> `ESP32S3-Specific` -> `Support for external, SPI-connected RAM` -> Set Type to **`Octal Mode PSRAM`** (`80MHz`).
+   * **OTA Partitions:** `Partition Table` -> `Partition Table Layout` -> Select **`Factory app, two OTA definitions`**.
    * Save (`S`) and Exit (`Q`).
 
-5. Compile the binary image, flash it via the USB-UART interface, and open the console monitor:
+4. Erase flash (first time only), build, and flash:
    ```bash
-   idf.py build flash monitor
-   ```
-   *Note: The built-in ESP-IDF Component Manager will automatically parse `idf_component.yml` and fetch the certified version of `espressif/esp32-camera` directly into your local workspace on the first run.*
-
-## Mobile Remote App (Flutter / Dart)
-
-The repository contains a native Android mobile control unit located in the `greenhouse_control_flutter/` directory. It operates as a synchronous, blocking TCP single-thread server that handles dynamic storage indexing, battery telemetry rendering, secure hardware alerts logging, and direct over-the-air firmware binaries uploading.
-
-### Mobile App Hardware Permissions
-The app runs safely under Android 11-14 (Scoped Storage compliant) without requesting global disk monitoring tokens.
-* **Firmware updates storage:** `/storage/emulated/0/Download/firmware.bin`
-* **Greenhouse Photo Archive:** Isolated inside application sandboxed environment: `Android/data/com.example.greenhouse_control_flutter/files/greenhouse_archive/` (accessible via advanced file managers like Cx File Explorer).
-
-### How to Build the Android APK
-
-1. Ensure the Flutter SDK is installed and verified on your Linux development system:
-   ```bash
-   flutter doctor
+   idf.py erase-flash
+   idf.py -p /dev/ttyACM0 build flash monitor
    ```
 
-2. Navigate to the mobile app component directory:
+## Mobile & Desktop Control App (Flutter)
+
+Located in `greenhouse_control_flutter/`, the app acts as a TCP server receiving telemetry and photos whenever the ESP32-S3 wakes up. It features a built-in **Command Terminal** with delayed queue execution (commands are queued while the board sleeps and executed sequentially by priority upon connection).
+
+### Supported Terminal Commands
+* `SET_TIME` — Synchronizes the ESP32-S3 system clock with the smartphone's Unix timestamp and renames the current session's photo.
+* `INT:<seconds>` — Sets a new wakeup/snapshot interval (`5` to `604800` seconds) and commits it to NVS flash.
+* `FORMAT_SD` — Formats the MicroSD card on the board and resets the file index counter.
+* `OTA` — Uploads a new firmware binary located at `/storage/emulated/0/Download/firmware.bin` over Wi-Fi and triggers a safe reboot.
+
+### Building Lightweight Android APK (~17 MB)
+1. Navigate to the Flutter directory and fetch dependencies:
    ```bash
    cd greenhouse_control_flutter
-   ```
-
-3. Download the necessary high-speed image processing packages and providers:
-   ```bash
    flutter pub get
    ```
-
-4. Connect your Android smartphone via USB with "USB Debugging" toggled on, and boot a live debug session:
+2. Build a split-ABI release APK with icon tree-shaking and install via ADB:
    ```bash
-   flutter run
+   flutter build apk --release --split-per-abi --tree-shake-icons
+   adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
    ```
-
-5. Compile a high-performance standalone release binary package (`.apk`) for deployment:
-   ```bash
-   flutter build apk --release
-   ```
-   *The compiled production package will be successfully generated at:* `build/app/outputs/flutter-apk/app-release.apk`
-
+*Downloaded photos are saved to:* `Android/data/com.example.greenhouse_control_flutter/files/greenhouse_archive/`
