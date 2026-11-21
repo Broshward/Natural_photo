@@ -494,29 +494,69 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
               padding: const EdgeInsets.all(8.0),
               child: Row(
                 children: [
+                  // === КНОПКА-СПИСОК ДОСТУПНЫХ КОМАНД ===
+                        // === БЕЗОПАСНАЯ КНОПКА-ШПАРГАЛКА ===
+                  IconButton(
+                    icon: const Icon(Icons.help_outline),
+                    tooltip: 'Справка по командам',
+                    onPressed: () {
+                      showDialog(
+                        context: context,
+                        builder: (BuildContext context) {
+                          return AlertDialog(
+                            title: const Text('Доступные команды'),
+                            content: const SingleChildScrollView(
+                              child: ListBody(
+                                children: [
+                                  Text('SET_TIME', style: TextStyle(fontWeight: FontWeight.bold)),
+                                  Text('Синхронизировать часы платы со смартфоном\n'),
+                                  
+                                  Text('INT:<секунды>', style: TextStyle(fontWeight: FontWeight.bold)),
+                                  Text('Интервал съёмки (от 15 до 604800 сек.)\n'),
+                                  
+                                  Text('FORMAT_SD', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
+                                  Text('Полная очистка SD-карты теплицы\n'),
+                                  
+                                  Text('OTA', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.orange)),
+                                  Text('Обновить прошивку из файла firmware.bin'),
+                                ],
+                              ),
+                            ),
+                            actions: [
+                              TextButton(
+                                child: const Text('Понятно'),
+                                onPressed: () => Navigator.of(context).pop(),
+                              ),
+                            ],
+                          );
+                        },
+                      );
+                    },
+                  ),
+
+                  // === ВАШЕ ПОЛЕ ВВОДА (БЕЗ ИЗМЕНЕНИЙ) ===
                   Expanded(
                     child: TextField(
-                      key: _commandFieldKey, // Защищаем виджет от пересоздания при setState!                      
+                      key: _commandFieldKey,
                       controller: _commandController,
-                      // Указываем тип действия для кнопки клавиатуры — "Отправить"
-                      textInputAction: TextInputAction.send, 
-                      // ХАК №1: Отправка и скрытие клавиатуры при нажатии на Enter/галочку самой клавиатуры!
+                      textInputAction: TextInputAction.send,
                       onSubmitted: (value) {
                         final cmd = value.trim();
                         if (cmd.isNotEmpty) {
                           _sendManualCommand(cmd);
                           _commandController.clear();
                         }
-                        // ХАК №2: Убираем фокус с поля, принудительно пряча клавиатуру!
                         FocusScope.of(context).unfocus();
                       },
                       decoration: const InputDecoration(
-                        labelText: 'Введите команду (например, SET_TIME)',
+                        labelText: 'Команда (нажмите ? для списка)',
                         border: OutlineInputBorder(),
                       ),
                     ),
                   ),
                   const SizedBox(width: 8),
+
+                  // === ВАША КНОПКА ОТПРАВКИ (БЕЗ ИЗМЕНЕНИЙ) ===
                   IconButton(
                     icon: const Icon(Icons.send),
                     onPressed: () {
@@ -525,7 +565,6 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
                         _sendManualCommand(cmd);
                         _commandController.clear();
                       }
-                      // Прячем клавиатуру и при нажатии на обычную кнопку-иконку на экране!
                       FocusScope.of(context).unfocus();
                     },
                   ),
