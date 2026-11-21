@@ -1,0 +1,5 @@
+#!/bin/bash
+
+cd greenhouse_control_flutter/
+flutter build apk --release --split-per-abi --tree-shake-icons && adb install -r build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+#flutter build apk --release && adb install -r build/app/outputs/flutter-apk/app-release.apk
