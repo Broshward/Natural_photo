@@ -48,6 +48,9 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
   
   final TextEditingController _dialogController = TextEditingController();
 
+  final TextEditingController _commandController = TextEditingController();
+  final GlobalKey _commandFieldKey = GlobalKey();
+
   @override
   void initState() {
     super.initState();
@@ -383,75 +386,6 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
     }
   }
 
-  void _showFormatDialog() {
-    _dialogController.clear();
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text("Очистка флешки теплицы"),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text("Эта операция полностью сотрет все файлы на SD-карте платы. Данное действие необратимо!"),
-            const SizedBox(height: 15),
-            TextField(
-              controller: _dialogController,
-              decoration: const InputDecoration(labelText: "Введите проверочное слово 'format'"),
-            )
-          ],
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("ОТМЕНА")),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-            onPressed: () {
-              if (_dialogController.text.trim().toLowerCase() == "format") {
-                setState(() { _formatRequested = true; _statusText = "Запрос очистки. Ожидание платы..."; });
-                Navigator.pop(context);
-              }
-            },
-            child: const Text("СТЕРЕТЬ ВСЁ"),
-          )
-        ],
-      ),
-    );
-  }
-
-  void _showOtaDialog() {
-    _dialogController.clear();
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text("Обновление прошивки по воздуху"),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text("Скопируйте файл 'firmware.bin' с помощью Cx Проводника в папку приложения: Android/data/com.example.greenhouse_control_flutter/files/greenhouse_archive/"),
-            const SizedBox(height: 15),
-            TextField(
-              controller: _dialogController,
-              decoration: const InputDecoration(labelText: "Введите проверочное слово 'firmware'"),
-            )
-          ],
-        ),
-
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("ОТМЕНА")),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
-            onPressed: () {
-              if (_dialogController.text.trim().toLowerCase() == "firmware") {
-                setState(() { _otaMode = true; _statusText = "Режим OTA активен. Ожидание платы..."; });
-                Navigator.pop(context);
-              }
-            },
-            child: const Text("ОБНОВИТЬ ПО"),
-          )
-        ],
-      ),
-    );
-  }
-
   void _sendManualCommand(String command) {
     final upperCmd = command.toUpperCase();
 
@@ -500,8 +434,6 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
     // Вычисляем, сколько кадров осталось скачать
     int framesLeft = _totalFramesOnBoard - _localFramesCount;
     if (framesLeft < 0) framesLeft = 0;
-
-    final TextEditingController _commandController = TextEditingController();
 
     return Scaffold(
       appBar: AppBar(title: const Text('Greenhouse Control Пульт')),
@@ -564,6 +496,7 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
                 children: [
                   Expanded(
                     child: TextField(
+                      key: _commandFieldKey, // Защищаем виджет от пересоздания при setState!                      
                       controller: _commandController,
                       // Указываем тип действия для кнопки клавиатуры — "Отправить"
                       textInputAction: TextInputAction.send, 
