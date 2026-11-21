@@ -62,6 +62,10 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
+#define JUMPER_OUT_PIN  GPIO_NUM_42  // Выход (будет выдавать логический 0)
+#define JUMPER_IN_PIN   GPIO_NUM_2   // Вход (будет читать уровень с подтяжкой к +3.3V)
+
+
 #define CAM_PIN_PWDN -1
 #define CAM_PIN_RESET -1   //software reset will be performed
 #define CAM_PIN_VSYNC 6
@@ -149,6 +153,34 @@ static esp_err_t init_camera(void)
     }
 
     return ESP_OK;
+}
+
+bool is_greenhouse_jumper_set(void) {
+    // 1. Обязательно сбрасываем оба пина (важно для GPIO 42, так как по умолчанию он JTAG MTMS!)
+    gpio_reset_pin(JUMPER_OUT_PIN);
+    gpio_reset_pin(JUMPER_IN_PIN);
+
+    // 2. Настраиваем GPIO 42 как выход и подаём на него жёсткий логический 0
+    gpio_set_direction(JUMPER_OUT_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(JUMPER_OUT_PIN, 0);
+
+    // 3. Настраиваем GPIO 2 как вход с внутренней подтяжкой к плюсу (3.3V)
+    gpio_set_direction(JUMPER_IN_PIN, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(JUMPER_IN_PIN, GPIO_PULLUP_ONLY);
+
+    // Даём 50 микросекунд на стабилизацию напряжения на дорожках
+    esp_rom_delay_us(50);
+
+    // Считываем уровень со 2-го пина
+    int level = gpio_get_level(JUMPER_IN_PIN);
+
+    // 4. ЭНЕРГОСБЕРЕЖЕНИЕ: Отключаем выход и подтяжку после опроса,
+    // чтобы через перемычку не утекал ток в глубоком сне!
+    gpio_set_direction(JUMPER_OUT_PIN, GPIO_MODE_DISABLE);
+    gpio_set_pull_mode(JUMPER_IN_PIN, GPIO_FLOATING);
+
+    // Если перемычка надета, ноль с GPIO 42 перетянет подтяжку GPIO 2, и level будет равен 0
+    return (level == 0);
 }
 
 void init_file_system_paths(void) 
@@ -774,19 +806,22 @@ void app_main(void)
 	// mode = 1  Photo mode. Button press mode. Photo & download. Этот mode для настройки камеры. Он делает фото и сразу отправляет его на смартфон. Turns on with a short press of the button
 	// mode = 2  Hold button mode (Download mode). This mode uses for download files. Turns on with a long  press of the button
 	//mode = 3  Greenhouse mode (Photo, saving and download mode). Это режим для теплицы. Кнопка игнорируется. Turns on with uncomment line below 
-	ESP_LOGI(TAG, "PIN 0 is %d", gpio_get_level(0));
-	if (wakeup_mask & (1 << ESP_SLEEP_WAKEUP_TIMER)) // По таймеру 
-		mode = 0; // Timer mode (Photo and save mode). This is ordinary mode.  
-	else if (wakeup_mask & (1 << ESP_SLEEP_WAKEUP_EXT0)) {
-		if (gpio_get_level(0)) {
-			mode = 1; // Button mode (Download mode) This mode uses for download files. 
-			boot_count = 1;
-		} else {
-			mode = 2; // Hold button mode (Setting mode). Этот mode для настройки камеры. Только фото и отправка  
-			while (!gpio_get_level(0)) {vTaskDelay(pdMS_TO_TICKS(100));}
-		}
-	}
-	mode = 3; //Greenhouse mode (Photo, saving and download mode). Это режим для теплицы. Кнопка игнорируется. Включается только так.
+    if (is_greenhouse_jumper_set()) {
+        mode = 3; // Greenhouse mode (Photo, saving and download mode). Кнопка игнорируется.
+        ESP_LOGW(TAG, "[🌱] Перемычка GPIO 42-2 замкнута -> Включён режим ТЕПЛИЦЫ (mode = 3)");
+    } 
+    else if (wakeup_mask & (1 << ESP_SLEEP_WAKEUP_TIMER)) {
+        mode = 0; // Timer mode (Photo and save mode)
+    } 
+    else if (wakeup_mask & (1 << ESP_SLEEP_WAKEUP_EXT0)) {
+        if (gpio_get_level(0)) {
+            mode = 1; // Button mode (Download mode)
+            boot_count = 1;
+        } else {
+            mode = 2; // Hold button mode (Setting mode)
+            while (!gpio_get_level(0)) { vTaskDelay(pdMS_TO_TICKS(100)); }
+        }
+    }
 	ESP_LOGW(TAG, "The mode is %d", mode);
 
 	// 1. Снимаем плановый кадр во временный буфер
@@ -823,10 +858,12 @@ void app_main(void)
 	        }
 			else {
 				ESP_LOGE(TAG, "Error hardware mask: %x", hardware_errors_mask);
-				ESP_LOGE(TAG, "fb = 0x%x", fb);
-				if (fb) ESP_LOGE(TAG, "fb->buf = 0x%x", fb->buf);
-				if (fb) ESP_LOGE(TAG, "fb->len = %d", fb->len);
-				if (is_jpeg_frame_too_dark(fb->buf, fb->len)) ESP_LOGE(TAG, "jpeg frame too dark!");
+				if (fb && fb->buf && fb->len > 0) {
+					ESP_LOGE(TAG, "fb->buf = %p, fb->len = %d", fb->buf, fb->len);
+					if (is_jpeg_frame_too_dark(fb->buf, fb->len)) {
+						ESP_LOGE(TAG, "jpeg frame too dark!");
+					}
+				}
 			}
 	    } else {
 	        hardware_errors_mask |= 0x04; 
@@ -846,64 +883,72 @@ void app_main(void)
 			if (server_requested_index != -1) {
 				last_sent_index = server_requested_index;
 			}
-			if (mode == 1)
-				last_sent_index = -1;
-
 			// ЗАЩИТА: Если камера или флешка выдали критическую аварию, 
 			// не мучаем систему отправкой очереди, а сразу завершаем сессию
-			if (!(hardware_errors_mask & 0x03)) { 
-				// Сетевой диалог Б: Потоковая выгрузка архива истории
-				bool mode_change = true;
-				for (int i = last_sent_index + 1; i <= boot_count; i++) {
-					uint64_t total_elapsed_sec = (esp_timer_get_time() - session_start_us) / 1000000ULL;
-					if (total_elapsed_sec >= (sleep_interval_sec - 5)) { 
-						ESP_LOGE(TAG, "Динамический таймер прервал очередь сессии.");
-						mode_change = false;
-						break; 
+						if (!(hardware_errors_mask & 0x03)) { 
+				
+				// === ВЕТКА 1: НАСТРОЙКА КАМЕРЫ (mode == 1) ===
+				// Отправляем живой буфер fb напрямую из памяти без сохранения на SD
+				if (mode == 1) {
+					if (fb && fb->buf && fb->len > 0) {
+						ESP_LOGI(TAG, "Режим настройки (mode=1): отправка живого кадра (%zu байт)...", fb->len);
+						// Передаём временное имя файла, чтобы смартфон его корректно принял и отобразил
+						if (send_file(fb->buf, fb->len, 0, "/live_preview.jpg")) {
+							ESP_LOGW(TAG, "[+] Настроечный кадр успешно отправлен на смартфон!");
+						} else {
+							ESP_LOGE(TAG, "[-] Ошибка отправки настроечного кадра.");
+						}
+					} else {
+						ESP_LOGE(TAG, "[-] Буфер живого кадра пуст (fb == NULL)!");
 					}
-
-					uint8_t *file_buf = NULL; size_t file_size = 0;
-					char file_path[64]; 
-
-                    if (sd_ok && !(hardware_errors_mask & 0x04)) {
-                        // Увеличили размер буфера до 64 байт, так как имя файла стало длиннее!
-                        struct stat st;
-
-                        // ИСПОЛЬЗУЕМ НАШУ НОВУЮ ФУНКЦИЮ ПОИСКА:
-                        // Она сканирует папку и сама запишет в file_path точный путь к файлу для индекса "i"
-                        if (find_file_by_index(i, file_path, sizeof(file_path))) {
-                            
-                            // Если файл успешно найден на карте, проверяем его размер через stat
-                            if (stat(file_path, &st) == 0) {
-                                file_size = st.st_size;
-                                file_buf = heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
-                                if (file_buf) {
-                                    FILE *f = fopen(file_path, "rb");
-                                    if (f) { 
-                                        fread(file_buf, 1, file_size, f); 
-                                        fclose(f); 
-                                    }
-                                }
-                            }
-                            ESP_LOGI(TAG, "File %s upload", file_path);
-                        } else {
-                            // Если файл не найден по индексу, логируем предупреждение, 
-                            // протокол не упадет, плата просто продолжит работу
-                            ESP_LOGW(TAG, "File with index %d not found on SD card", i);
-                        }
-                    }
-
-					if (file_buf && file_size > 0) {
-						if (!send_file(file_buf, file_size, i, file_path)) { 
-							heap_caps_free(file_buf); 
+					mode = 0; // Возвращаем в обычный режим перед сном
+				} 
+				// === ВЕТКА 2: ВЫГРУЗКА АРХИВА С SD-КАРТЫ (mode == 2 и mode == 3) ===
+				else {
+					bool mode_change = true;
+					for (int i = last_sent_index + 1; i <= boot_count; i++) {
+						uint64_t total_elapsed_sec = (esp_timer_get_time() - session_start_us) / 1000000ULL;
+						if (total_elapsed_sec >= (sleep_interval_sec - 5)) { 
+							ESP_LOGE(TAG, "Динамический таймер прервал очередь сессии.");
+							mode_change = false;
 							break; 
 						}
-						last_sent_index = i;
-						heap_caps_free(file_buf);
-						vTaskDelay(pdMS_TO_TICKS(15));
+
+						uint8_t *file_buf = NULL; size_t file_size = 0;
+						char file_path[64]; 
+
+						if (sd_ok && !(hardware_errors_mask & 0x04)) {
+							struct stat st;
+							if (find_file_by_index(i, file_path, sizeof(file_path))) {
+								if (stat(file_path, &st) == 0) {
+									file_size = st.st_size;
+									file_buf = heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
+									if (file_buf) {
+										FILE *f = fopen(file_path, "rb");
+										if (f) { 
+											fread(file_buf, 1, file_size, f); 
+											fclose(f); 
+										}
+									}
+								}
+								ESP_LOGI(TAG, "File %s upload", file_path);
+							} else {
+								ESP_LOGW(TAG, "File with index %d not found on SD card", i);
+							}
+						}
+
+						if (file_buf && file_size > 0) {
+							if (!send_file(file_buf, file_size, i, file_path)) { 
+								heap_caps_free(file_buf); 
+								break; 
+							}
+							last_sent_index = i;
+							heap_caps_free(file_buf);
+							vTaskDelay(pdMS_TO_TICKS(15));
+						}
 					}
+					if (mode_change) mode = 0;
 				}
-				if (mode_change) mode = 0;
 			}
 			esp_wifi_stop();
 		}
