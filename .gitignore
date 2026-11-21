@@ -16,3 +16,16 @@ GRTAGS
 GTAGS
 cscope*
 pdf/
+
+
+# Лишние платформы и файлы Flutter (android/ и linux/ оставляем!)
+greenhouse_control_flutter/ios/
+greenhouse_control_flutter/macos/
+greenhouse_control_flutter/windows/
+greenhouse_control_flutter/web/
+greenhouse_control_flutter/test/
+greenhouse_control_flutter/.metadata
+greenhouse_control_flutter/analysis_options.yaml
+greenhouse_control_flutter/README.md
+greenhouse_control_flutter/greenhouse.jpg
+greenhouse_control_flutter/ic_launcher.png
