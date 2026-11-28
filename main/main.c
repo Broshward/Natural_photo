@@ -403,14 +403,18 @@ bool send_info()
     uint32_t bat_mv = read_battery_millivolts();
     uint32_t free_mb = global_card_handle ? get_sd_free_space_mb() : 0;
 
+	time_t now;
+	time(&now);
+	
     // Пункт №3: Передаем hardware_errors_mask вместо индекса кадра в холостом пинге!
-    uint32_t header[6] = { 
+    uint32_t header[7] = { 
 		hardware_errors_mask,   // [0] маска аппаратных ошибок
 		0,                      // [1] зарезервировано
 		bat_mv,				    // [2] напряжение батареи (или ваш текущий параметр)
 		free_mb,			    // [3] свободное место на флешке
 		sleep_interval_sec,      // [5] текущий интервал сна в секундах!
-		rtc_saved_file_index	// [4] всего кадров на флешке
+		rtc_saved_file_index,	// [4] всего кадров на флешке
+		(uint32_t)now			// [6] Время на плате.
 	};
     if (send(sock, header, sizeof(header), 0) < 0) { close(sock); return false; }
 
@@ -961,15 +965,18 @@ void app_main(void)
 		esp_camera_deinit(); 		
 	}	
 	
-    if (sd_ok && global_card_handle) {
-        if (format_requested) { 
-            format_requested = false; 
-            format_sd_card(); 
-			rtc_saved_file_index = 0;
-        } else { 
-            esp_vfs_fat_sdcard_unmount(MOUNT_POINT, global_card_handle); 
-        }
-    }
+	if (format_requested) { 
+		format_requested = false; 
+		if (!sd_ok) {
+			if (init_sd_card(&global_card_handle) == ESP_OK) {
+				sd_ok = true;
+			}
+		}
+		format_sd_card(); 
+		rtc_saved_file_index = 0;
+	} else { 
+		esp_vfs_fat_sdcard_unmount(MOUNT_POINT, global_card_handle); 
+	}
 	
 	if (ota_requested) {
 		ESP_LOGW(TAG, "[🚀] Карта очищена, флаги зафиксированы. Перезапускаемся на новую прошивку!");
@@ -987,15 +994,24 @@ void app_main(void)
     rtc_gpio_pullup_en(0);
     rtc_gpio_pulldown_dis(0);
 
-    int elapsed_sec = (int)((esp_timer_get_time() - session_start_us) / 1000000ULL);
-    int sleep_time_sec = sleep_interval_sec - elapsed_sec;
+ // 850000 мкс (0.85 сек) — фиксированное время работы ROM-загрузчика и теста 8 МБ PSRAM
+    // до запуска FreeRTOS + 50000 мкс на уход в сон = 900000 мкс (0.90 сек)
+    const int64_t boot_overhead_us = 900000LL; 
 
-	//???
-    if (sleep_time_sec < 5) sleep_time_sec = 5;
-	// Это может мешать при малых sleep_interval_sec
+    int64_t total_awake_us = esp_timer_get_time() + boot_overhead_us; 
+    int64_t target_us      = (int64_t)sleep_interval_sec * 1000000LL;
+    int64_t sleep_us       = target_us - total_awake_us;
 
-    ESP_LOGW(TAG, "Ухожу в глубокий сон на %d сек.", sleep_time_sec);
-    esp_sleep_enable_timer_wakeup((uint64_t)sleep_time_sec * 1000000LL);
-	if (mode == 0 || mode == 1) esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
-    esp_deep_sleep_start();
-}
+    if (sleep_us < 1000000LL) {
+        sleep_us = 1000000LL;
+    }
+
+    ESP_LOGW(TAG, "Бодрствовал: %.2f сек. Ухожу в глубокий сон на %.2f сек.", 
+             (double)total_awake_us / 1000000.0, (double)sleep_us / 1000000.0);
+             
+    esp_sleep_enable_timer_wakeup((uint64_t)sleep_us);
+    
+    if (mode == 0 || mode == 1) {
+        esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+    }
+    esp_deep_sleep_start();}

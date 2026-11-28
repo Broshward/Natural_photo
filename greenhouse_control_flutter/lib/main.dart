@@ -51,6 +51,8 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
   final TextEditingController _commandController = TextEditingController();
   final GlobalKey _commandFieldKey = GlobalKey();
 
+  String _boardTimeText = "Время платы: ";        
+
   @override
   void initState() {
     super.initState();
@@ -168,6 +170,16 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
     return result;
   }
 
+  String get _queuedCommandsText {
+    List<String> queue = [];
+    if (_syncTimeRequested) queue.add("SET_TIME");
+    if (_newIntervalSeconds != null) queue.add("INT:$_newIntervalSeconds");
+    if (_formatRequested) queue.add("FORMAT_SD");
+    if (_otaMode) queue.add("OTA");
+    
+    return queue.isEmpty ? "Очередь команд: пусто" : "Ждут отправки: ${queue.join(', ')}";
+  }
+
   // ЛИНЕЙНЫЙ ДИСПЕТЧЕР С ПОШАГОВЫМ ОЖИДАНИЕМ БУФЕРА
   void _handleEsp32Connection(Socket client) async {
     client.timeout(const Duration(seconds: 15)); 
@@ -190,7 +202,7 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
       
     // Константы протокола (меняются только здесь!)
     const int baseHeaderInts = 4; // 4 числа = 16 байт (базовый заголовок)
-    const int pingExtraInts  = 2; // +2 числа = 8 байт (индекс последнего кадра + интервал сна)
+    const int pingExtraInts  = 3; // +3 числа = 8 байт (индекс последнего кадра + интервал сна + текущее время)
 
     try {
       // 1. Читаем базовый заголовок (4 числа uint32)
@@ -208,13 +220,19 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
       // СЦЕНАРИЙ А: Холостой пинг (imgSize == 0)
       // =======================================================================
       if (imgSize == 0) {
-        // Дочитываем хвост пинга (ещё 2 числа uint32)
+        // Дочитываем хвост пинга (ещё 3 числа uint32)
         final extraBytes = await _readExactBytes(pingExtraInts * 4, currentBuffer, iterator);
         if (extraBytes == null) { await client.close(); iterator.cancel(); return; }
 
         final extra = extraBytes.buffer.asUint32List();
         final int boardIntervalSec    = extra[0]; // Пятое  число с платы (интервал сна)
         final int lastSavedFrameIndex = extra[1]; // Шестое число с платы
+        final int boardTimeSec = extra[2];
+
+        // Форматируем время платы в красивую строку ЧЧ:ММ:СС (и дату ДД.ММ)
+        final dt = DateTime.fromMillisecondsSinceEpoch(boardTimeSec * 1000, isUtc: true);
+        String boardTimeStr = "${dt.day.toString().padLeft(2, '0')}.${dt.month.toString().padLeft(2, '0')} "
+                              "${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}:${dt.second.toString().padLeft(2, '0')}";
 
         // Расчёт батареи и ошибок
         double batV = batMv / 1000.0;
@@ -229,6 +247,7 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
           if ((imgIndex & 0x04) != 0) errorsList.add("Карта SD неисправна");
           hardwareLog = "[Авария]: ${errorsList.join(', ')}";
         }
+        // Обновляем время платы на экране!
 
         int maxSavedIdx = await get_max_saved_index();
 
@@ -239,6 +258,7 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
           _totalFramesOnBoard = lastSavedFrameIndex;
           _localFramesCount = maxSavedIdx;
           if (boardIntervalSec > 0) _currentIntervalSec = boardIntervalSec;
+          _boardTimeText = "Время платы: $boardTimeStr";          
         });
 
         // --- Очередь ручных команд (строго по приоритету) ---
@@ -246,13 +266,14 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
 
         // Приоритет №1: Время
         if (_syncTimeRequested) {
-          final unixSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-          client.add(Uint8List.fromList("TIME:$unixSec".codeUnits));
+          final now = DateTime.now();
+          // Прибавляем смещение часового пояса телефона (например, +3 часа для Москвы)
+          final localUnixSec = (now.millisecondsSinceEpoch + now.timeZoneOffset.inMilliseconds) ~/ 1000;
+          
+          client.add(Uint8List.fromList("TIME:$localUnixSec".codeUnits));
           await client.flush();
           _syncTimeRequested = false;
           commandSent = true;
-          print("⏰ [FLUTTER] Отправлено время: TIME:$unixSec");
-          await Future.delayed(const Duration(milliseconds: 50));
         }
 
         // Приоритет №2: Форматирование SD
@@ -460,6 +481,8 @@ class _GreenhouseScreenState extends State<GreenhouseScreen> {
             const SizedBox(height: 5),
             Text(_batteryText, style: const TextStyle(fontSize: 15, color: Colors.greenAccent)),
             
+            Text(_queuedCommandsText),
+            Text(_boardTimeText),
             // =======================================================================
             // НАШ НОВЫЙ БЛОК: ИНДИКАТОР ОЧЕРЕДИ СКАЧИВАНИЯ КАДРОВ
             // =======================================================================
